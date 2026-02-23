@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenClaw xNode sync (config + OAuth)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/opt/openclaw-sync/env
+ExecStart=/opt/openclaw-sync/openclaw-sync
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

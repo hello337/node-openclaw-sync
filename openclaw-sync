@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+#
+# OpenClaw ↔ xNode sync: fetches config from xNode API and applies it to the local
+# OpenClaw instance (agents_defaults, tools_web_search, oauth_url_requests, oauth_pending).
+# Run on the server where OpenClaw is installed; use with systemd timer or cron.
+#
+# Required env:
+#   OPENCLAW_CONFIG_TOKEN  — from xNode admin (Token modal for your OpenClaw node)
+# Optional:
+#   OPENCLAW_API_BASE     — default https://api.xnode.pro
+#
+# API: GET /openclaw/config, POST /openclaw/oauth-auth-url, POST /openclaw/oauth-consumed
+#
+
+set -e
+
+: "${OPENCLAW_CONFIG_TOKEN:?Set OPENCLAW_CONFIG_TOKEN (from xNode admin → OpenClaw node → Token)}"
+: "${OPENCLAW_API_BASE:=https://api.xnode.pro}"
+
+RESP="$(curl -s -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" "$OPENCLAW_API_BASE/openclaw/config")"
+if ! echo "$RESP" | head -c1 | grep -q '{'; then
+    echo "Failed to fetch config (check token and API base): $RESP" >&2
+    exit 1
+fi
+
+if ! command -v jq &>/dev/null; then
+    echo "jq is required." >&2
+    exit 1
+fi
+
+# Patch config: agents_defaults (models allowlist) and tools_web_search (Brave Search)
+AGENTS_DEFAULTS="$(echo "$RESP" | jq -c '.agents_defaults // empty')"
+TOOLS_WEB_SEARCH="$(echo "$RESP" | jq -c '.tools_web_search // empty')"
+NEED_PATCH="false"
+if [ -n "$AGENTS_DEFAULTS" ] && [ "$AGENTS_DEFAULTS" != "null" ] && [ "$(echo "$AGENTS_DEFAULTS" | jq -r 'keys | length')" -gt 0 ]; then
+    NEED_PATCH="true"
+fi
+if [ -n "$TOOLS_WEB_SEARCH" ] && [ "$TOOLS_WEB_SEARCH" != "null" ]; then
+    NEED_PATCH="true"
+fi
+if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
+    HASH="$(openclaw gateway call config.get --params '{}' 2>/dev/null | jq -r '.payload.hash // .hash // empty')"
+    if [ -n "$HASH" ]; then
+        RAW_JSON="$(jq -n \
+            --argjson ad "$AGENTS_DEFAULTS" \
+            --argjson tw "$TOOLS_WEB_SEARCH" \
+            '(if $ad != null and ($ad | keys | length) > 0 then { agents: { defaults: $ad } } else {} end) * (if $tw != null then { tools: { web: { search: $tw } } } else {} end)' \
+            | jq -c .)"
+        if [ -n "$RAW_JSON" ] && [ "$RAW_JSON" != "{}" ]; then
+            PARAMS="$(jq -n --arg h "$HASH" --arg r "$RAW_JSON" '{ baseHash: $h, raw: $r }')"
+            if openclaw gateway call config.patch --params "$PARAMS" 2>/dev/null; then
+                : "config patch applied"
+            fi
+        fi
+    fi
+fi
+
+# oauth_url_requests: user requested auth link (e.g. Qwen Portal). Run login, capture URL, POST to xNode.
+OAUTH_URL_REQUESTS="$(echo "$RESP" | jq -r '.oauth_url_requests // {} | to_entries[] | select(.value == true) | .key' 2>/dev/null)"
+for KEY in $OAUTH_URL_REQUESTS; do
+    [ -z "$KEY" ] && continue
+    PROVIDER="$(echo "$KEY" | sed 's/_/-/g')"
+    if ! command -v openclaw &>/dev/null; then
+        echo "oauth_url_requests.$KEY: openclaw not in PATH" >&2
+        continue
+    fi
+    OUT="$(timeout 20 openclaw models auth login --provider "$PROVIDER" 2>&1)" || true
+    AUTH_URL="$(echo "$OUT" | grep -oE 'https://[^ )[\]"'\''<>]+' | head -1)"
+    if [ -n "$AUTH_URL" ]; then
+        if curl -s -X POST \
+            -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg k "$KEY" --arg u "$AUTH_URL" '{ key: $k, auth_url: $u }')" \
+            "$OPENCLAW_API_BASE/openclaw/oauth-auth-url" | jq -e '.ok' >/dev/null 2>&1; then
+            echo "oauth_url_requests.$KEY: auth URL sent to xNode" >&2
+        else
+            echo "oauth_url_requests.$KEY: failed to POST auth URL" >&2
+        fi
+    else
+        echo "oauth_url_requests.$KEY: no URL in output (run manually: openclaw models auth login --provider $PROVIDER)" >&2
+    fi
+done
+
+OAUTH_PENDING="$(echo "$RESP" | jq -c '.oauth_pending // {}')"
+if [ "$OAUTH_PENDING" = "{}" ]; then
+    exit 0
+fi
+
+CONSUMED=()
+
+VAL="$(echo "$RESP" | jq -r '.oauth_pending.anthropic_setup_token // empty')"
+if [ -n "$VAL" ]; then
+    if echo "$VAL" | openclaw models auth paste-token --provider anthropic 2>/dev/null; then
+        CONSUMED+=("anthropic_setup_token")
+    fi
+fi
+
+VAL="$(echo "$RESP" | jq -r '.oauth_pending.openai_codex // empty')"
+if [ -n "$VAL" ]; then
+    if (echo "$VAL"; sleep 1) | timeout 30 openclaw models auth login --provider openai-codex 2>/dev/null; then
+        CONSUMED+=("openai_codex")
+    fi
+fi
+
+if [ ${#CONSUMED[@]} -eq 0 ]; then
+    exit 0
+fi
+
+KEYS_JSON="$(printf '%s\n' "${CONSUMED[@]}" | jq -R . | jq -s .)"
+curl -s -X POST \
+    -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"keys\": $KEYS_JSON}" \
+    "$OPENCLAW_API_BASE/openclaw/oauth-consumed" >/dev/null || true

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run OpenClaw xNode sync every 10 seconds
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=10
+Persistent=true
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
