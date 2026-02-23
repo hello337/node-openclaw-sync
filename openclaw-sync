@@ -93,13 +93,14 @@ if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
 fi
 
 # --- 2) oauth_url_requests: enable plugin, run login to get auth URL, POST to xNode ---
+# enable_plugin_for_key KEY — runs plugin enable for that key; outputs openclaw stdout so caller can detect "Enabled plugin"
 enable_plugin_for_key() {
     case "$1" in
-        google_antigravity) openclaw plugins enable google-antigravity-auth 2>/dev/null ;;
-        qwen_portal)        openclaw plugins enable qwen-portal-auth 2>/dev/null ;;
-        google_gemini_cli)  openclaw plugins enable google-gemini-cli-auth 2>/dev/null ;;
-        minimax_portal)     openclaw plugins enable minimax-portal-auth 2>/dev/null ;;
-        *) ;;
+        google_antigravity) openclaw plugins enable google-antigravity-auth 2>&1 ;;
+        qwen_portal)        openclaw plugins enable qwen-portal-auth 2>&1 ;;
+        google_gemini_cli)  openclaw plugins enable google-gemini-cli-auth 2>&1 ;;
+        minimax_portal)     openclaw plugins enable minimax-portal-auth 2>&1 ;;
+        *) echo "" ;;
     esac
 }
 
@@ -114,6 +115,31 @@ run_with_timeout() {
 }
 
 OAUTH_URL_REQUESTS_RAW="$(echo "$RESP" | jq -r '.oauth_url_requests // {} | to_entries[] | select(.value == true) | .key' 2>/dev/null)" || true
+# Phase A: enable all needed plugins; if any was newly enabled, restart gateway so they load
+NEED_GATEWAY_RESTART=0
+while IFS= read -r KEY || [ -n "$KEY" ]; do
+    KEY="$(echo "${KEY:-}" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -z "$KEY" ] && continue
+    if ! command -v openclaw &>/dev/null; then
+        continue
+    fi
+    ENABLE_OUT="$(enable_plugin_for_key "$KEY")"
+    if echo "$ENABLE_OUT" | grep -qi "Enabled plugin\|Restart the gateway to apply"; then
+        NEED_GATEWAY_RESTART=1
+    fi
+done <<< "$OAUTH_URL_REQUESTS_RAW"
+
+if [ "$NEED_GATEWAY_RESTART" = "1" ]; then
+    echo "Restarting OpenClaw gateway to apply plugin(s)..." >&2
+    if openclaw gateway restart 2>/dev/null; then
+        echo "Waiting for gateway to come back (10s)..." >&2
+        sleep 10
+    else
+        echo "Warning: gateway restart failed or not available; run 'openclaw gateway restart' manually if needed." >&2
+    fi
+fi
+
+# Phase B: get auth URL for each key and POST to xNode
 while IFS= read -r KEY || [ -n "$KEY" ]; do
     KEY="$(echo "${KEY:-}" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$KEY" ] && continue
@@ -122,7 +148,6 @@ while IFS= read -r KEY || [ -n "$KEY" ]; do
         echo "oauth_url_requests.$KEY: openclaw not in PATH" >&2
         continue
     fi
-    enable_plugin_for_key "$KEY"
     OUT="$(run_with_timeout 25 openclaw models auth login --provider "$PROVIDER" 2>&1)" || true
     if echo "$OUT" | grep -qi "no provider plugins found"; then
         echo "oauth_url_requests.$KEY: Enable the plugin (e.g. openclaw plugins enable qwen-portal-auth), restart the OpenClaw gateway, then run this script again." >&2
