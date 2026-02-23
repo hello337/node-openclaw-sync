@@ -14,7 +14,7 @@
 
 set -e
 
-: "${OPENCLAW_CONFIG_TOKEN:?Set OPENCLAW_CONFIG_TOKEN (from xNode admin → OpenClaw node → Token)}"
+: "${OPENCLAW_CONFIG_TOKEN:?Set OPENCLAW_CONFIG_TOKEN (from xNode admin: OpenClaw node -> Token)}"
 : "${OPENCLAW_API_BASE:=https://api.xnode.pro}"
 
 RESP="$(curl -s -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" "$OPENCLAW_API_BASE/openclaw/config")"

@@ -22,7 +22,7 @@ fi
 if [ ! -f "$INSTALL_DIR/env" ]; then
     if [ -f "$INSTALL_DIR/env.example" ]; then
         cp "$INSTALL_DIR/env.example" "$INSTALL_DIR/env"
-        echo "Created $INSTALL_DIR/env — edit it and set OPENCLAW_CONFIG_TOKEN."
+        echo "Created $INSTALL_DIR/env - edit it and set OPENCLAW_CONFIG_TOKEN."
     else
         touch "$INSTALL_DIR/env"
         echo "Created empty env — add OPENCLAW_CONFIG_TOKEN=your-token"

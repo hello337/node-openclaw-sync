@@ -1,102 +1,102 @@
 # node-openclaw-sync
 
-Синхронизация конфига и OAuth между [xNode](https://xnode.pro) и локальным инстансом [OpenClaw](https://docs.openclaw.ai). Запускается на сервере, где установлен OpenClaw: тянет настройки из xNode API и применяет их (agents_defaults, tools_web_search, OAuth-токены, запросы ссылок для device flow).
+Syncs config and OAuth between [xNode](https://xnode.pro) and a local [OpenClaw](https://docs.openclaw.ai) instance. Run on the server where OpenClaw is installed: it fetches settings from the xNode API and applies them (agents_defaults, tools_web_search, OAuth tokens, auth-link requests for device flow).
 
-**Требования на сервере:** `curl`, `jq`, `openclaw` в PATH.
+**Requirements on the server:** `curl`, `jq`, and `openclaw` in PATH.
 
 ---
 
-## Первый запуск на сервере
+## First-time setup on the server
 
-Папку `/opt` создавать не обязательно. Клонируй репо **куда удобно** (домашний каталог, `/opt`, `/srv` — без разницы); установка идёт «на месте»: systemd будет запускать скрипт из этой же папки.
+You don't need to use `/opt`. Clone the repo **wherever you like** (home dir, `/opt`, `/srv`); installation is in-place: systemd will run the script from that directory.
 
-### 1. Клонировать репозиторий
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/YOUR_USER/node-openclaw-sync.git
 cd node-openclaw-sync
 ```
 
-(Замени `YOUR_USER` на свой GitHub. Путь может быть любым, например `~/node-openclaw-sync` или `/opt/node-openclaw-sync`.)
+(Replace `YOUR_USER` with your GitHub username. The path can be anything, e.g. `~/node-openclaw-sync` or `/opt/node-openclaw-sync`.)
 
-### 2. Задать токен
+### 2. Set the token
 
-Токен берёшь в админке xNode: **Pending Nodes** (или All Users Nodes) → нужная запись **OpenClaw** → кнопка **«Token»** → скопировать.
+Get the token from the xNode admin: **Pending Nodes** (or All Users Nodes) → your **OpenClaw** record → **Token** button → copy.
 
 ```bash
 cp env.example env
 nano env
 ```
 
-В файле `env` укажи:
+In `env` set:
 
 ```
-OPENCLAW_CONFIG_TOKEN=вставь_сюда_токен_из_админки
+OPENCLAW_CONFIG_TOKEN=your-token-from-admin
 ```
 
-Опционально, если API не на api.xnode.pro:
+Optionally, if the API is not at api.xnode.pro:
 
 ```
 OPENCLAW_API_BASE=https://your-api-host
 ```
 
-Сохрани и закрой.
+Save and exit.
 
-### 3. Установить и включить таймер
+### 3. Install and enable the timer
 
 ```bash
 chmod +x install.sh
 sudo ./install.sh
 ```
 
-Скрипт не копирует файлы в другую папку: он записывает в systemd путь **к текущей папке** (где лежит репо) и поднимает таймер (каждые **10 секунд**). Файл `env` при первом запуске создаётся из `env.example`, если его ещё нет.
+The script does not copy files elsewhere: it tells systemd to use **this directory** (the repo) and enables a timer that runs every **10 seconds**. On first run, `env` is created from `env.example` if it doesn't exist.
 
-### 4. Проверить
+### 4. Verify
 
 ```bash
 systemctl status openclaw-sync.timer
 journalctl -u openclaw-sync.service -f
 ```
 
-Таймер должен быть `active`, в логах не должно быть ошибок про токен или сеть.
+The timer should be `active`; logs should show no token or network errors.
 
 ---
 
-## Обновления: как стягивать с GitHub и перезапускать
+## Updating: pull from GitHub and restart
 
-Перейди в папку репо и подтяни изменения, затем перезапусти таймер:
+Go to the repo directory, pull, then restart the timer:
 
 ```bash
-cd /путь/к/node-openclaw-sync   # тот путь, куда клонировал
+cd /path/to/node-openclaw-sync   # wherever you cloned
 sudo git pull
 sudo systemctl restart openclaw-sync.timer
 ```
 
-Или одной строкой (подставь свой путь):
+Or in one line (use your path):
 
 ```bash
 cd ~/node-openclaw-sync && sudo git pull && sudo systemctl restart openclaw-sync.timer
 ```
 
-Файл `env` при `git pull` не трогается (он в `.gitignore`).
+The `env` file is not modified by `git pull` (it's in `.gitignore`).
 
-**Через update.sh:**
+**Using update.sh:**
 
 ```bash
-cd /путь/к/node-openclaw-sync
+cd /path/to/node-openclaw-sync
 git pull
 sudo ./update.sh
 ```
 
-`update.sh` делает `git pull` и перезапускает таймер.
+`update.sh` runs `git pull` and restarts the timer.
 
 ---
 
-## Что делает скрипт
+## What the script does
 
-- **GET /openclaw/config** — получает конфиг по токену.
-- Применяет **agents_defaults** и **tools_web_search** к локальному OpenClaw через `openclaw gateway call config.patch`.
-- Обрабатывает **oauth_url_requests**: по запросу ссылки (например Qwen Portal) запускает `openclaw models auth login --provider ...`, забирает URL из вывода и шлёт его в xNode (**POST /openclaw/oauth-auth-url**).
-- Применяет **oauth_pending** (токены/callback URL) через OpenClaw CLI и помечает их как применённые (**POST /openclaw/oauth-consumed**).
+- **GET /openclaw/config** — fetches config using the token.
+- Applies **agents_defaults** and **tools_web_search** to the local OpenClaw via `openclaw gateway call config.patch`.
+- Handles **oauth_url_requests**: when a user requests an auth link (e.g. Qwen Portal), runs `openclaw models auth login --provider ...`, extracts the URL from output, and sends it to xNode (**POST /openclaw/oauth-auth-url**).
+- Applies **oauth_pending** (tokens / callback URLs) via the OpenClaw CLI and marks them as applied (**POST /openclaw/oauth-consumed**).
 
-Токен и API base задаются через файл `env` в корне репо (см. `env.example`).
+Token and API base are read from the `env` file in the repo root (see `env.example`).
