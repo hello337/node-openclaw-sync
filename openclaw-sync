@@ -14,6 +14,15 @@
 
 set -e
 
+# Load env from script directory so manual runs use current env (systemd also sets EnvironmentFile=)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/env" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/env"
+    set +a
+fi
+
 : "${OPENCLAW_CONFIG_TOKEN:?Set OPENCLAW_CONFIG_TOKEN (from xNode admin: OpenClaw node -> Token)}"
 : "${OPENCLAW_API_BASE:=https://api.xnode.pro}"
 
