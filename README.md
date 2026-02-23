@@ -4,6 +4,18 @@ Syncs config and OAuth between [xNode](https://xnode.pro) and a local [OpenClaw]
 
 **Requirements on the server:** `curl`, `jq`, and `openclaw` in PATH.
 
+**Provider plugins:** For "Get auth link" (OAuth/device flow), the script enables the right plugin per provider (see [OpenClaw docs](https://docs.openclaw.ai/concepts/model-providers)) and captures the URL to send to xNode. After the first enable of a plugin, **restart the OpenClaw gateway** once so it loads. Then the script applies pasted tokens/URLs from the config and marks them consumed; `agents_defaults` from the API enables all models for the configured providers.
+
+| xNode config key     | OpenClaw provider    | Plugin to enable (script does it) |
+|----------------------|----------------------|-----------------------------------|
+| openai_codex         | openai-codex         | (built-in)                        |
+| google_antigravity   | google-antigravity   | google-antigravity-auth           |
+| qwen_portal          | qwen-portal          | qwen-portal-auth                  |
+| github_copilot       | github-copilot       | (built-in)                        |
+| google_gemini_cli    | google-gemini-cli    | google-gemini-cli-auth            |
+| minimax_portal       | minimax-portal       | minimax-portal-auth               |
+| anthropic_setup_token| anthropic            | (paste-token, no plugin)          |
+
 ---
 
 ## First-time setup on the server
@@ -94,9 +106,11 @@ sudo ./update.sh
 
 ## What the script does
 
-- **GET /openclaw/config** — fetches config using the token.
-- Applies **agents_defaults** and **tools_web_search** to the local OpenClaw via `openclaw gateway call config.patch`.
-- Handles **oauth_url_requests**: when a user requests an auth link (e.g. Qwen Portal), runs `openclaw models auth login --provider ...`, extracts the URL from output, and sends it to xNode (**POST /openclaw/oauth-auth-url**).
-- Applies **oauth_pending** (tokens / callback URLs) via the OpenClaw CLI and marks them as applied (**POST /openclaw/oauth-consumed**).
+1. **GET /openclaw/config** — fetches config (env, oauth_pending, oauth_url_requests, agents_defaults, tools_web_search).
+2. **agents_defaults + tools_web_search** — applies them via `openclaw gateway call config.patch` so all models for configured providers are enabled and Brave Search is set if present.
+3. **oauth_url_requests** (user clicked "Get auth link" on the site): for each requested provider, the script enables the plugin if needed, runs `openclaw models auth login --provider <id>`, captures the auth URL from output, and sends it to xNode (**POST /openclaw/oauth-auth-url**). The frontend then shows the link; the user opens it, signs in, and pastes the callback URL back.
+4. **oauth_pending** (user pasted token or callback URL): the script applies each value — `anthropic_setup_token` via `openclaw models auth paste-token --provider anthropic`, all other keys via `openclaw models auth login --provider <id>` with the value fed to stdin. Then it marks those keys as consumed (**POST /openclaw/oauth-consumed**). After that, agents_defaults from step 2 keeps all models for those providers enabled.
+
+API keys (env) are only sent in the config; OpenClaw receives them through the same config.patch when agents_defaults is applied. No extra step needed for API-key-only providers.
 
 Token and API base are read from the `env` file in the repo root (see `env.example`).
