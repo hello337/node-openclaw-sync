@@ -53,7 +53,7 @@ journalctl -u openclaw-sync.service -f
 Two-phase flow handled entirely without the OpenClaw CLI:
 
 1. **Phase B** (user clicks "Get auth link"): Script calls the provider's device-code API directly, gets `verification_uri` + `user_code`, saves `device_code` and PKCE verifier to state file, POSTs URL to xNode.
-2. **Phase 0** (every 10s): Polls the provider's token endpoint using saved `device_code`. When user approves → saves token to `auth-profiles.json` → applies `config.patch` → notifies xNode.
+2. **Phase 0** (every 10s): Polls the provider's token endpoint using saved `device_code`. When user approves → saves token to `~/.openclaw/agents/main/agent/auth-profiles.json` → applies `config.patch` (provider config + `agents.defaults`) → notifies xNode.
 
 ### Redirect OAuth providers (OpenAI Codex, Google Gemini CLI)
 

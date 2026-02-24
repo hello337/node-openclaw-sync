@@ -34,7 +34,7 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
 DEVICE_CODE_STATE_DIR="/tmp/openclaw-sync-device-codes"
 RESTART_FLAG="/tmp/openclaw-sync-gateway-restarted"
-PROFILES_FILE="$OPENCLAW_STATE_DIR/agents/default/agent/auth-profiles.json"
+PROFILES_FILE="$OPENCLAW_STATE_DIR/agents/main/agent/auth-profiles.json"
 
 if ! command -v jq &>/dev/null; then echo "jq is required." >&2; exit 1; fi
 if ! command -v openssl &>/dev/null; then echo "openssl is required." >&2; exit 1; fi
@@ -86,11 +86,19 @@ save_state() {
 
 save_auth_profile() {
     local profile_id="$1" profile_json="$2"
-    local existing="{}"
-    [ -f "$PROFILES_FILE" ] && { existing="$(jq -c '.' "$PROFILES_FILE" 2>/dev/null)" || existing="{}"; }
+    local existing='{"version":1,"profiles":{}}'
+    if [ -f "$PROFILES_FILE" ]; then
+        existing="$(jq -c '.' "$PROFILES_FILE" 2>/dev/null)" || existing='{"version":1,"profiles":{}}'
+        if ! echo "$existing" | jq -e '.version' &>/dev/null; then
+            existing="$(echo "$existing" | jq -c '{ version: 1, profiles: . }')"
+        fi
+        if ! echo "$existing" | jq -e '.profiles' &>/dev/null; then
+            existing="$(echo "$existing" | jq -c '. + { profiles: {} }')"
+        fi
+    fi
     local updated
     updated="$(echo "$existing" | jq --arg pid "$profile_id" --argjson prof "$profile_json" \
-        '. + { ($pid): $prof }' 2>/dev/null)" || return 1
+        '.profiles[$pid] = $prof' 2>/dev/null)" || return 1
     mkdir -p "$(dirname "$PROFILES_FILE")"
     echo "$updated" > "$PROFILES_FILE"
 }
@@ -108,11 +116,16 @@ apply_provider_config_patch() {
 
 post_oauth_consumed() {
     local key="$1"
-    curl -s -w "\n%{http_code}" -X POST \
+    local resp code
+    resp="$(curl -s -w "\n%{http_code}" -X POST \
         -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" \
         -H "Content-Type: application/json" \
         -d "{\"keys\": [\"$key\"]}" \
-        "$OPENCLAW_API_BASE/openclaw/oauth-consumed" 2>/dev/null || true
+        "$OPENCLAW_API_BASE/openclaw/oauth-consumed" 2>/dev/null)" || true
+    code="$(echo "$resp" | tail -1)"
+    if [ "$code" != "200" ]; then
+        echo "post_oauth_consumed($key): HTTP $code" >&2
+    fi
 }
 
 url_decode() {
@@ -180,7 +193,14 @@ save_qwen_token() {
                 { id: "vision-model", name: "Qwen Vision", reasoning: false, input: ["text","image"],
                   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 }
             ]
-        }}}
+        }}},
+        agents: { defaults: {
+            model: "qwen-portal/coder-model",
+            models: {
+                "qwen-portal/coder-model": { alias: "qwen" },
+                "qwen-portal/vision-model": {}
+            }
+        }}
     }' 2>/dev/null)" || true
     [ -n "$cfg" ] && apply_provider_config_patch "$cfg" && echo "qwen_portal: config.patch applied" >&2
 }
@@ -212,6 +232,17 @@ save_github_copilot_token() {
         "$(jq -n --arg t "$token" '{ type: "token", provider: "github-copilot", token: $t }')" \
         || { echo "github_copilot: failed to save profile" >&2; return 1; }
     echo "github_copilot: saved GitHub token" >&2
+
+    local cfg
+    cfg="$(jq -n '{
+        agents: { defaults: {
+            model: "github-copilot/claude-opus-4-5",
+            models: {
+                "github-copilot/claude-opus-4-5": { alias: "copilot" }
+            }
+        }}
+    }' 2>/dev/null)" || true
+    [ -n "$cfg" ] && apply_provider_config_patch "$cfg" && echo "github_copilot: config.patch applied" >&2
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -257,7 +288,14 @@ save_minimax_token() {
                 { id: "MiniMax-M2.5", name: "MiniMax M2.5", reasoning: true, input: ["text"],
                   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 8192 }
             ]
-        }}}
+        }}},
+        agents: { defaults: {
+            model: "minimax-portal/MiniMax-M2.1",
+            models: {
+                "minimax-portal/MiniMax-M2.1": { alias: "minimax" },
+                "minimax-portal/MiniMax-M2.5": {}
+            }
+        }}
     }' 2>/dev/null)" || true
     [ -n "$cfg" ] && apply_provider_config_patch "$cfg" && echo "minimax_portal: config.patch applied" >&2
 }
@@ -292,6 +330,17 @@ save_openai_codex_token() {
         '{ type: "oauth", provider: "openai-codex", access: $a, refresh: $r, expires: $e }')" \
         || { echo "openai_codex: failed to save profile" >&2; return 1; }
     echo "openai_codex: saved OAuth token" >&2
+
+    local cfg
+    cfg="$(jq -n '{
+        agents: { defaults: {
+            model: "openai-codex/gpt-5.3-codex",
+            models: {
+                "openai-codex/gpt-5.3-codex": { alias: "codex" }
+            }
+        }}
+    }' 2>/dev/null)" || true
+    [ -n "$cfg" ] && apply_provider_config_patch "$cfg" && echo "openai_codex: config.patch applied" >&2
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -389,7 +438,14 @@ save_gemini_cli_token() {
                 { id: "gemini-3-flash-preview", name: "Gemini 3 Flash", reasoning: false, input: ["text","image"],
                   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 65536 }
             ]
-        }}}
+        }}},
+        agents: { defaults: {
+            model: "google-gemini-cli/gemini-3-pro-preview",
+            models: {
+                "google-gemini-cli/gemini-3-pro-preview": { alias: "gemini" },
+                "google-gemini-cli/gemini-3-flash-preview": {}
+            }
+        }}
     }' 2>/dev/null)" || true
     [ -n "$cfg" ] && apply_provider_config_patch "$cfg" && echo "google_gemini_cli: config.patch applied" >&2
 }
