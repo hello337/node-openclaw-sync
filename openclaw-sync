@@ -36,6 +36,9 @@ DEVICE_CODE_STATE_DIR="/tmp/openclaw-sync-device-codes"
 RESTART_FLAG="/tmp/openclaw-sync-gateway-restarted"
 PROFILES_FILE="$OPENCLAW_STATE_DIR/agents/main/agent/auth-profiles.json"
 
+# Track whether a full gateway restart is needed (auth-profiles.json changed)
+OAUTH_TOKEN_SAVED=0
+
 if ! command -v jq &>/dev/null; then echo "jq is required." >&2; exit 1; fi
 if ! command -v openssl &>/dev/null; then echo "openssl is required." >&2; exit 1; fi
 
@@ -168,10 +171,14 @@ apply_provider_config_patch() {
     PATCH_RESP="$(gateway_call_json config.patch --params "$PARAMS")" || {
         echo "apply_provider_config_patch: config.patch command failed" >&2; return 1
     }
-    local err
-    err="$(echo "$PATCH_RESP" | jq -r '.error // empty' 2>/dev/null)"
-    if [ -n "$err" ]; then
-        echo "apply_provider_config_patch: config.patch returned error: $err" >&2; return 1
+    local ok_field err_msg
+    ok_field="$(echo "$PATCH_RESP" | jq -r '.ok // empty' 2>/dev/null)"
+    err_msg="$(echo "$PATCH_RESP" | jq -r 'if .error then (if .error | type == "string" then .error elif .error | type == "object" then (.error.message // (.error | tostring)) else (.error | tostring) end) else empty end' 2>/dev/null)"
+    if [ -n "$err_msg" ]; then
+        echo "apply_provider_config_patch: config.patch error: $err_msg" >&2; return 1
+    fi
+    if [ "$ok_field" = "false" ]; then
+        echo "apply_provider_config_patch: config.patch ok=false: $(echo "$PATCH_RESP" | jq -c '.' 2>/dev/null | head -c 500)" >&2; return 1
     fi
     return 0
 }
@@ -199,6 +206,26 @@ extract_url_param() {
     local val
     val="$(echo "$url" | grep -oE "[?&]${param}=([^&]*)" | head -1 | sed "s/[?&]${param}=//")"
     [ -n "$val" ] && url_decode "$val"
+}
+
+# Full gateway stop+start to reload auth-profiles.json and config from disk.
+# SIGUSR1 (triggered by config.patch) only reloads openclaw.json but NOT
+# the AuthProfileStore cache, so OAuth credentials written to auth-profiles.json
+# won't be picked up without a full restart.
+full_gateway_restart() {
+    command -v openclaw &>/dev/null || return 0
+    echo "full_gateway_restart: stopping gateway to reload auth-profiles.json..." >&2
+    openclaw gateway stop 2>/dev/null || true
+    local GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
+    local i
+    for i in $(seq 1 15); do
+        (lsof -nP -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN 2>/dev/null | grep -q .) || break
+        sleep 1
+    done
+    echo "full_gateway_restart: starting gateway..." >&2
+    openclaw gateway start 2>/dev/null || true
+    openclaw gateway health --timeout 20000 2>/dev/null || true
+    echo "full_gateway_restart: done" >&2
 }
 
 # true if this provider is handled via direct API (not CLI)
@@ -238,7 +265,8 @@ save_qwen_token() {
         "$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" \
         '{ type: "oauth", provider: "qwen-portal", access: $a, refresh: $r, expires: $e }')" \
         || { echo "qwen_portal: failed to save profile" >&2; return 1; }
-    echo "qwen_portal: saved OAuth token" >&2
+    OAUTH_TOKEN_SAVED=1
+    echo "qwen_portal: saved OAuth token to $PROFILES_FILE" >&2
 
     local base_url="https://portal.qwen.ai/v1"
     if [ -n "$resource_url" ] && [ "$resource_url" != "null" ]; then
@@ -308,13 +336,14 @@ save_github_copilot_token() {
     save_auth_profile "github-copilot:default" \
         "$(jq -n --arg t "$token" '{ type: "api_key", provider: "github-copilot", key: $t }')" \
         || { echo "github_copilot: failed to save profile" >&2; return 1; }
-    echo "github_copilot: saved GitHub token" >&2
+    OAUTH_TOKEN_SAVED=1
+    echo "github_copilot: saved GitHub token to $PROFILES_FILE" >&2
 
     local cfg
     cfg="$(jq -n '{
         auth: {
             profiles: {
-                "github-copilot:default": { provider: "github-copilot", mode: "oauth" }
+                "github-copilot:default": { provider: "github-copilot", mode: "api_key" }
             },
             order: { "github-copilot": ["github-copilot:default"] }
         },
@@ -365,7 +394,8 @@ save_minimax_token() {
         "$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" \
         '{ type: "oauth", provider: "minimax-portal", access: $a, refresh: $r, expires: $e }')" \
         || { echo "minimax_portal: failed to save profile" >&2; return 1; }
-    echo "minimax_portal: saved OAuth token" >&2
+    OAUTH_TOKEN_SAVED=1
+    echo "minimax_portal: saved OAuth token to $PROFILES_FILE" >&2
 
     local base_url="https://api.minimax.io/anthropic"
     [ -n "$resource_url" ] && [ "$resource_url" != "null" ] && base_url="$resource_url"
@@ -434,7 +464,8 @@ save_openai_codex_token() {
         "$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" \
         '{ type: "oauth", provider: "openai-codex", access: $a, refresh: $r, expires: $e }')" \
         || { echo "openai_codex: failed to save profile" >&2; return 1; }
-    echo "openai_codex: saved OAuth token" >&2
+    OAUTH_TOKEN_SAVED=1
+    echo "openai_codex: saved OAuth token to $PROFILES_FILE" >&2
 
     local cfg
     cfg="$(jq -n '{
@@ -545,7 +576,8 @@ save_gemini_cli_token() {
         '{ type: "oauth", provider: "google-gemini-cli", access: $a, refresh: $r, expires: $e } + (if $p != "" then { projectId: $p } else {} end)')"
     save_auth_profile "google-gemini-cli:default" "$profile" \
         || { echo "google_gemini_cli: failed to save profile" >&2; return 1; }
-    echo "google_gemini_cli: saved OAuth token (project: ${project_id:-none})" >&2
+    OAUTH_TOKEN_SAVED=1
+    echo "google_gemini_cli: saved OAuth token to $PROFILES_FILE (project: ${project_id:-none})" >&2
 
     local cfg
     cfg="$(jq -n '{
@@ -706,6 +738,12 @@ if [ -d "$DEVICE_CODE_STATE_DIR" ]; then
     done
 fi
 
+# Full restart if any OAuth tokens were saved in Phase 0 polling
+if [ "$OAUTH_TOKEN_SAVED" = "1" ]; then
+    full_gateway_restart
+    OAUTH_TOKEN_SAVED=0
+fi
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 0) Fetch config from xNode
 # ──────────────────────────────────────────────────────────────────────────────
@@ -716,11 +754,6 @@ RESP_BODY="$(echo "$RESP" | sed '$d')"
 if [ "$HTTP_CODE" != "200" ]; then echo "Failed to fetch config: HTTP $HTTP_CODE" >&2; exit 1; fi
 if ! echo "$RESP_BODY" | jq -e . >/dev/null 2>&1; then echo "Config response is not valid JSON" >&2; exit 1; fi
 RESP="$RESP_BODY"
-
-# Gateway may have restarted after Phase 0 config.patch — wait for it
-if command -v openclaw &>/dev/null; then
-    openclaw gateway health --timeout 15000 2>/dev/null || true
-fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) Write API keys to ~/.openclaw/.env + apply config via config.patch
@@ -1121,6 +1154,12 @@ while IFS= read -r KEY || [ -n "$KEY" ]; do
             ;;
     esac
 done <<< "$OAUTH_PENDING_KEYS"
+
+# Full restart if any OAuth tokens were saved in Phase 3
+if [ "$OAUTH_TOKEN_SAVED" = "1" ]; then
+    full_gateway_restart
+    OAUTH_TOKEN_SAVED=0
+fi
 
 [ ${#CONSUMED[@]} -eq 0 ] && exit 0
 
