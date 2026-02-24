@@ -74,7 +74,18 @@ run_with_timeout() {
 # openclaw gateway call outputs "Gateway call: <method>" on stdout before JSON.
 # This helper strips all non-JSON prefix lines so jq can parse the result.
 gateway_call_json() {
-    openclaw gateway call "$@" 2>/dev/null | sed -n '/^[{[]/,$p'
+    local raw
+    raw="$(openclaw gateway call "$@" 2>/dev/null)" || return 1
+    [ -z "$raw" ] && return 1
+    # Try strict match (JSON at line start), then relaxed (optional whitespace)
+    local json
+    json="$(echo "$raw" | sed -n '/^[[:space:]]*[{[]/,$p')"
+    if [ -n "$json" ]; then
+        echo "$json"
+    else
+        # Last resort: strip everything before the first { on ANY line
+        echo "$raw" | awk '/{/{found=1} found'
+    fi
 }
 
 generate_pkce() {
@@ -229,14 +240,22 @@ save_qwen_token() {
         || { echo "qwen_portal: failed to save profile" >&2; return 1; }
     echo "qwen_portal: saved OAuth token" >&2
 
+    local base_url="https://portal.qwen.ai/v1"
+    if [ -n "$resource_url" ] && [ "$resource_url" != "null" ]; then
+        base_url="$resource_url"
+        base_url="$(echo "$base_url" | sed 's|/*$||')"
+        echo "$base_url" | grep -q '/v1$' || base_url="${base_url}/v1"
+    fi
+
     local cfg
-    cfg="$(jq -n '{
+    cfg="$(jq -n --arg bu "$base_url" '{
         auth: {
             profiles: {
                 "qwen-portal:default": { provider: "qwen-portal", mode: "oauth" }
             },
             order: { "qwen-portal": ["qwen-portal:default"] }
         },
+        models: { providers: { "qwen-portal": { baseUrl: $bu } } },
         agents: { defaults: {
             model: { primary: "qwen-portal/coder-model" },
             models: {
@@ -691,6 +710,11 @@ if [ "$HTTP_CODE" != "200" ]; then echo "Failed to fetch config: HTTP $HTTP_CODE
 if ! echo "$RESP_BODY" | jq -e . >/dev/null 2>&1; then echo "Config response is not valid JSON" >&2; exit 1; fi
 RESP="$RESP_BODY"
 
+# Gateway may have restarted after Phase 0 config.patch — wait for it
+if command -v openclaw &>/dev/null; then
+    openclaw gateway health --timeout 15000 2>/dev/null || true
+fi
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) Write API keys to ~/.openclaw/.env + apply config via config.patch
 # ──────────────────────────────────────────────────────────────────────────────
@@ -736,6 +760,12 @@ if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
     HASH=""
     if [ -n "$GET_RESP_MAIN" ]; then
         HASH="$(echo "$GET_RESP_MAIN" | jq -r '.payload.hash // .hash // .configHash // empty' 2>/dev/null)" || HASH=""
+        if [ -z "$HASH" ]; then
+            _keys="$(echo "$GET_RESP_MAIN" | jq -r 'keys | join(", ")' 2>/dev/null)" || _keys="?"
+            echo "Warning: config.get returned JSON but no hash field (keys: $_keys)" >&2
+        fi
+    else
+        echo "Warning: config.get returned empty (gateway may be restarting)" >&2
     fi
     if [ -n "$HASH" ]; then
         RAW_JSON="$(jq -n \
