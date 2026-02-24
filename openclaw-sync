@@ -14,12 +14,16 @@
 # API: GET /openclaw/config, POST /openclaw/oauth-auth-url, POST /openclaw/oauth-consumed
 #
 # OpenClaw docs (verified):
-# - config.get / config.patch: docs.openclaw.ai/gateway/configuration (baseHash, raw as JSON5 string)
-# - agents.defaults (model.primary, model.fallbacks, models): same + gateway/configuration-examples
-# - tools.web.search: docs.openclaw.ai/gateway/configuration-reference (enabled, apiKey, maxResults, timeoutSeconds)
+# - config.get / config.patch: docs.openclaw.ai/gateway/configuration
+# - agents.defaults: docs.openclaw.ai/gateway/configuration-examples
+# - tools.web.search: docs.openclaw.ai/gateway/configuration-reference
 # - Plugins & auth: docs.openclaw.ai/concepts/model-providers, concepts/oauth
-#   openai-codex: built-in. google-antigravity: google-antigravity-auth. qwen-portal: qwen-portal-auth.
-#   github-copilot: built-in. google-gemini-cli: google-gemini-cli-auth. minimax portal: minimax-portal-auth.
+# - CLI models auth login: docs.openclaw.ai/cli/models
+#     IMPORTANT: requires interactive TTY to print device-code URL (GitHub #13192).
+#     We use `script -qec` to provide a pseudo-TTY from systemd.
+# - gateway start/stop: docs.openclaw.ai/cli/gateway — needs XDG_RUNTIME_DIR for user services.
+# - plugins enable/list: docs.openclaw.ai/cli/plugins — enable is idempotent; restart gateway to load.
+# - gateway health: docs.openclaw.ai/gateway/health — `openclaw gateway health` or `openclaw health`.
 #
 
 set -e
@@ -34,16 +38,75 @@ fi
 
 : "${OPENCLAW_CONFIG_TOKEN:?Set OPENCLAW_CONFIG_TOKEN (from xNode admin: OpenClaw node -> Token)}"
 : "${OPENCLAW_API_BASE:=https://api.xnode.pro}"
-# Strip trailing slash so we don't request //openclaw/config
 OPENCLAW_API_BASE="${OPENCLAW_API_BASE%/}"
 [ -z "$OPENCLAW_API_BASE" ] && OPENCLAW_API_BASE="https://api.xnode.pro"
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 if ! command -v jq &>/dev/null; then
     echo "jq is required." >&2
     exit 1
 fi
 
-# --- Fetch config ---
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+plugin_for_key() {
+    case "$1" in
+        google_antigravity) echo "google-antigravity-auth" ;;
+        qwen_portal)        echo "qwen-portal-auth" ;;
+        google_gemini_cli)  echo "google-gemini-cli-auth" ;;
+        minimax_portal)     echo "minimax-portal-auth" ;;
+        *)                  echo "" ;;
+    esac
+}
+
+provider_for_key() {
+    echo "$1" | sed 's/_/-/g'
+}
+
+strip_ansi() {
+    sed $'s/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b([0-9;]*[a-zA-Z]//g; s/\r//g'
+}
+
+# Detect pseudo-TTY support (Linux `script -qec`)
+HAS_SCRIPT_PTY=0
+if command -v script &>/dev/null; then
+    if script -q -e -c "echo __pty_ok__" /dev/null 2>/dev/null | grep -q "__pty_ok__"; then
+        HAS_SCRIPT_PTY=1
+    fi
+fi
+
+# Run a command with a timeout. If we have `script`, wrap in a pseudo-TTY so
+# interactive CLIs (like openclaw models auth login) produce full output.
+run_with_pty() {
+    local t="$1"; shift
+    if [ "$HAS_SCRIPT_PTY" = "1" ]; then
+        local cmd
+        cmd="$(printf '%q ' "$@")"
+        timeout "$t" script -q -e -c "$cmd" /dev/null 2>&1 | strip_ansi
+    elif command -v timeout &>/dev/null; then
+        timeout "$t" "$@" 2>&1
+    else
+        "$@" 2>&1
+    fi
+}
+
+# Plain timeout wrapper (no PTY needed)
+run_with_timeout() {
+    local t="$1"; shift
+    if command -v timeout &>/dev/null; then
+        timeout "$t" "$@" 2>&1
+    else
+        "$@" 2>&1
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 0) Fetch config from xNode
+# ──────────────────────────────────────────────────────────────────────────────
+
 RESP="$(curl -s -S -w "\n%{http_code}" -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" "$OPENCLAW_API_BASE/openclaw/config")"
 HTTP_CODE="$(echo "$RESP" | tail -1)"
 RESP_BODY="$(echo "$RESP" | sed '$d')"
@@ -65,28 +128,38 @@ fi
 
 RESP="$RESP_BODY"
 
-# Ensure gateway allows local CLI connections without pairing (loopback-only safe). Takes effect after next gateway restart.
+# Ensure gateway allows local CLI connections without manual pairing.
+# File-level change; takes effect on next gateway restart.
 if command -v openclaw &>/dev/null; then
     openclaw config set gateway.controlUi.allowInsecureAuth true 2>/dev/null || true
 fi
 
-# --- 1) Apply agents_defaults and tools_web_search (enables models for configured providers) ---
+# ──────────────────────────────────────────────────────────────────────────────
+# 1) Apply agents_defaults and tools_web_search via config.patch
+# ──────────────────────────────────────────────────────────────────────────────
+
 AGENTS_DEFAULTS="$(echo "$RESP" | jq -c '.agents_defaults // empty' 2>/dev/null)" || AGENTS_DEFAULTS=""
 TOOLS_WEB_SEARCH="$(echo "$RESP" | jq -c '.tools_web_search // empty' 2>/dev/null)" || TOOLS_WEB_SEARCH=""
 NEED_PATCH="false"
-if [ -n "$AGENTS_DEFAULTS" ] && [ "$AGENTS_DEFAULTS" != "null" ] && [ "$(echo "$AGENTS_DEFAULTS" | jq -r 'keys | length' 2>/dev/null)" -gt 0 ] 2>/dev/null; then
+
+if [ -n "$AGENTS_DEFAULTS" ] && [ "$AGENTS_DEFAULTS" != "null" ] && \
+   [ "$(echo "$AGENTS_DEFAULTS" | jq -r 'keys | length' 2>/dev/null)" -gt 0 ] 2>/dev/null; then
     NEED_PATCH="true"
 fi
 if [ -n "$TOOLS_WEB_SEARCH" ] && [ "$TOOLS_WEB_SEARCH" != "null" ]; then
     NEED_PATCH="true"
 fi
+
 if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
     HASH="$(openclaw gateway call config.get --params '{}' 2>/dev/null | jq -r '.payload.hash // .hash // empty' 2>/dev/null)" || HASH=""
     if [ -n "$HASH" ]; then
         RAW_JSON="$(jq -n \
-            --argjson ad "$AGENTS_DEFAULTS" \
-            --argjson tw "$TOOLS_WEB_SEARCH" \
-            '(if $ad != null and ($ad | type) == "object" and ($ad | keys | length) > 0 then { agents: { defaults: $ad } } else {} end) * (if $tw != null and ($tw | type) == "object" and ($tw | keys | length) > 0 then { tools: { web: { search: $tw } } } else {} end)' \
+            --argjson ad "${AGENTS_DEFAULTS:-null}" \
+            --argjson tw "${TOOLS_WEB_SEARCH:-null}" \
+            '(if $ad != null and ($ad | type) == "object" and ($ad | keys | length) > 0
+              then { agents: { defaults: $ad } } else {} end)
+           * (if $tw != null and ($tw | type) == "object" and ($tw | keys | length) > 0
+              then { tools: { web: { search: $tw } } } else {} end)' \
             2>/dev/null | jq -c . 2>/dev/null)" || RAW_JSON=""
         if [ -n "$RAW_JSON" ] && [ "$RAW_JSON" != "{}" ]; then
             PARAMS="$(jq -n --arg h "$HASH" --arg r "$RAW_JSON" '{ baseHash: $h, raw: $r }' 2>/dev/null)" || true
@@ -97,49 +170,41 @@ if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
     fi
 fi
 
-# --- 2) oauth_url_requests: enable plugin, run login to get auth URL, POST to xNode ---
-# enable_plugin_for_key KEY — runs plugin enable for that key; outputs openclaw stdout so caller can detect "Enabled plugin"
-enable_plugin_for_key() {
-    case "$1" in
-        google_antigravity) openclaw plugins enable google-antigravity-auth 2>&1 ;;
-        qwen_portal)        openclaw plugins enable qwen-portal-auth 2>&1 ;;
-        google_gemini_cli)  openclaw plugins enable google-gemini-cli-auth 2>&1 ;;
-        minimax_portal)     openclaw plugins enable minimax-portal-auth 2>&1 ;;
-        *) echo "" ;;
-    esac
-}
-
-run_with_timeout() {
-    local t="$1"
-    shift
-    if command -v timeout &>/dev/null; then
-        timeout "$t" "$@" 2>&1
-    else
-        "$@" 2>&1
-    fi
-}
+# ──────────────────────────────────────────────────────────────────────────────
+# 2) oauth_url_requests: enable plugin → restart gateway → get auth URL → POST
+# ──────────────────────────────────────────────────────────────────────────────
 
 OAUTH_URL_REQUESTS_RAW="$(echo "$RESP" | jq -r '.oauth_url_requests // {} | to_entries[] | select(.value == true) | .key' 2>/dev/null)" || true
-# Phase A: enable all needed plugins; if any was newly enabled, restart gateway so they load
+[ -z "$OAUTH_URL_REQUESTS_RAW" ] && OAUTH_URL_REQUESTS_RAW=""
+
+# -- Phase A: enable plugins that aren't yet enabled --
 NEED_GATEWAY_RESTART=0
+RESTART_FLAG="/tmp/openclaw-sync-gateway-restarted"
+
 while IFS= read -r KEY || [ -n "$KEY" ]; do
     KEY="$(echo "${KEY:-}" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$KEY" ] && continue
-    if ! command -v openclaw &>/dev/null; then
+    command -v openclaw &>/dev/null || continue
+
+    PLUGIN="$(plugin_for_key "$KEY")"
+    [ -z "$PLUGIN" ] && continue
+
+    # Check if plugin is already known to the CLI (enabled in config).
+    # `plugins list` reads from config + discovery, so it works even if
+    # the gateway hasn't loaded the plugin yet.
+    if openclaw plugins list 2>/dev/null | grep -qi "$PLUGIN"; then
         continue
     fi
-    ENABLE_OUT="$(enable_plugin_for_key "$KEY")"
-    if echo "$ENABLE_OUT" | grep -qi "Enabled plugin\|Restart the gateway to apply"; then
-        NEED_GATEWAY_RESTART=1
-    fi
+
+    ENABLE_OUT="$(openclaw plugins enable "$PLUGIN" 2>&1)" || true
+    echo "plugins enable $PLUGIN: $ENABLE_OUT" >&2
+    NEED_GATEWAY_RESTART=1
 done <<< "$OAUTH_URL_REQUESTS_RAW"
 
-# Gateway restart with loop-prevention: `openclaw gateway start` may return non-zero purely
-# because its built-in health check times out on slow startups with plugins (OpenClaw #22972).
-# The daemon IS running — it just wasn't "healthy" within the CLI timeout. We always exit 0
-# after starting it and let the *next* run (10s later) proceed to Phase B. A flag file with a
-# 120s cooldown prevents re-restarting the gateway on subsequent runs.
-RESTART_FLAG="/tmp/openclaw-sync-gateway-restarted"
+# -- Gateway restart with loop prevention --
+# Only restart if we just enabled a NEW plugin. A flag file with 120s cooldown
+# prevents the script from re-restarting on every run. After restart we exit 0
+# to let the gateway fully start before Phase B runs on the next timer tick.
 if [ "$NEED_GATEWAY_RESTART" = "1" ]; then
     SKIP_RESTART=0
     if [ -f "$RESTART_FLAG" ]; then
@@ -148,13 +213,11 @@ if [ "$NEED_GATEWAY_RESTART" = "1" ]; then
         FLAG_AGE=$(( NOW - FLAG_MTIME ))
         if [ "$FLAG_AGE" -lt 120 ]; then
             SKIP_RESTART=1
-            echo "Gateway restart was initiated ${FLAG_AGE}s ago; skipping restart, proceeding to Phase B." >&2
         fi
     fi
 
     if [ "$SKIP_RESTART" = "0" ]; then
-        echo "Restarting OpenClaw gateway to apply plugin(s)..." >&2
-        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        echo "Restarting OpenClaw gateway to load new plugin(s)..." >&2
         openclaw gateway stop 2>&1 || true
         GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
         for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -164,55 +227,84 @@ if [ "$NEED_GATEWAY_RESTART" = "1" ]; then
             [ "$i" -eq 1 ] && echo "Waiting for gateway port $GATEWAY_PORT to be free..." >&2
             sleep 1
         done
+        # Non-zero exit from `gateway start` may just mean the health check
+        # timed out (OpenClaw #22972); the daemon is still starting.
         openclaw gateway start 2>&1 || true
         touch "$RESTART_FLAG"
-        echo "Gateway restart initiated; auth URL will be fetched on next run (~10s)." >&2
+        echo "Gateway restart initiated. Auth URL will be fetched on next run (~10s)." >&2
         exit 0
     fi
 fi
 
-# Phase B: get auth URL for each key and POST to xNode
+# -- Pre-flight: check that the gateway is reachable before Phase B --
+if [ -n "$OAUTH_URL_REQUESTS_RAW" ]; then
+    if ! openclaw gateway health --timeout 10000 2>/dev/null; then
+        echo "Gateway is not healthy; skipping auth URL fetch. Will retry next run." >&2
+        exit 0
+    fi
+fi
+
+# -- Phase B: run auth login with pseudo-TTY to capture the device-code URL --
+# OpenClaw's CLI suppresses interactive output (URLs, device codes) when stdout
+# is not a TTY. We use Linux `script -qec` to wrap the command in a pseudo-TTY.
+# See: github.com/openclaw/openclaw/discussions/13192
 while IFS= read -r KEY || [ -n "$KEY" ]; do
     KEY="$(echo "${KEY:-}" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$KEY" ] && continue
-    PROVIDER="$(echo "$KEY" | sed 's/_/-/g')"
-    if ! command -v openclaw &>/dev/null; then
-        echo "oauth_url_requests.$KEY: openclaw not in PATH" >&2
+    command -v openclaw &>/dev/null || { echo "oauth_url_requests.$KEY: openclaw not in PATH" >&2; continue; }
+
+    PROVIDER="$(provider_for_key "$KEY")"
+
+    OUT="$(run_with_pty 45 openclaw models auth login --provider "$PROVIDER")" || true
+
+    # Log full output for diagnostics (visible in journalctl)
+    if [ -n "$OUT" ]; then
+        echo "oauth_url_requests.$KEY: auth login raw output: $OUT" >&2
+    else
+        echo "oauth_url_requests.$KEY: auth login produced no output" >&2
+    fi
+
+    if echo "$OUT" | grep -qi "no provider plugins found\|provider not found\|unknown provider"; then
+        echo "oauth_url_requests.$KEY: plugin not loaded. Restart the gateway: openclaw gateway restart" >&2
         continue
     fi
-    OUT="$(run_with_timeout 45 openclaw models auth login --provider "$PROVIDER" 2>&1)" || true
-    if echo "$OUT" | grep -qi "no provider plugins found"; then
-        echo "oauth_url_requests.$KEY: Enable the plugin (e.g. openclaw plugins enable qwen-portal-auth), restart the OpenClaw gateway, then run this script again." >&2
-        continue
-    fi
-    # Extract URL: common patterns (https, verification_uri in JSON, Open/Visit lines)
+
+    # Extract URL — try several patterns
     AUTH_URL="$(echo "$OUT" | grep -oE 'https://[^ )[\]"'\''<>]+' | head -1)"
     [ -z "$AUTH_URL" ] && AUTH_URL="$(echo "$OUT" | grep -oE '"verification_uri"[[:space:]]*:[[:space:]]*"[^"]+"' | sed 's/.*"\(https\?:[^"]*\)".*/\1/' | head -1)"
     [ -z "$AUTH_URL" ] && AUTH_URL="$(echo "$OUT" | grep -oE 'https?://[^ )[\]"'\''<>]+' | head -1)"
-    if [ -n "$AUTH_URL" ]; then
-        POST_BODY="$(jq -n --arg k "$KEY" --arg u "$AUTH_URL" '{ key: $k, auth_url: $u }' 2>/dev/null)" || true
-        if [ -n "$POST_BODY" ]; then
-            POST_RESP="$(curl -s -w "\n%{http_code}" -X POST \
-                -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "$POST_BODY" \
-                "$OPENCLAW_API_BASE/openclaw/oauth-auth-url")" || true
-            POST_CODE="$(echo "$POST_RESP" | tail -1)"
-            if [ "$POST_CODE" = "200" ] && echo "$POST_RESP" | sed '$d' | jq -e '.ok' >/dev/null 2>&1; then
-                echo "oauth_url_requests.$KEY: auth URL sent to xNode" >&2
-                rm -f "$RESTART_FLAG"
-            else
-                echo "oauth_url_requests.$KEY: failed to POST auth URL (HTTP $POST_CODE). Ensure OPENCLAW_API_BASE ($OPENCLAW_API_BASE) is the same API your frontend uses." >&2
-            fi
-        else
-            echo "oauth_url_requests.$KEY: failed to build request body" >&2
-        fi
+
+    if [ -z "$AUTH_URL" ]; then
+        echo "oauth_url_requests.$KEY: no URL in output. Try running manually: openclaw models auth login --provider $PROVIDER" >&2
+        continue
+    fi
+
+    # POST auth URL to xNode
+    POST_BODY="$(jq -n --arg k "$KEY" --arg u "$AUTH_URL" '{ key: $k, auth_url: $u }' 2>/dev/null)" || true
+    if [ -z "$POST_BODY" ]; then
+        echo "oauth_url_requests.$KEY: failed to build request body" >&2
+        continue
+    fi
+
+    POST_RESP="$(curl -s -w "\n%{http_code}" -X POST \
+        -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$POST_BODY" \
+        "$OPENCLAW_API_BASE/openclaw/oauth-auth-url")" || true
+    POST_CODE="$(echo "$POST_RESP" | tail -1)"
+
+    if [ "$POST_CODE" = "200" ] && echo "$POST_RESP" | sed '$d' | jq -e '.ok' >/dev/null 2>&1; then
+        echo "oauth_url_requests.$KEY: auth URL sent to xNode" >&2
+        rm -f "$RESTART_FLAG"
     else
-        echo "oauth_url_requests.$KEY: no URL in output. Run manually on the server: openclaw models auth login --provider $PROVIDER (check if a URL is printed). Ensure OPENCLAW_API_BASE points to the same API as your frontend." >&2
+        echo "oauth_url_requests.$KEY: POST failed (HTTP $POST_CODE). Check OPENCLAW_API_BASE=$OPENCLAW_API_BASE" >&2
     fi
 done <<< "$OAUTH_URL_REQUESTS_RAW"
 
-# --- 3) oauth_pending: apply tokens/URLs on server, then mark consumed ---
+# ──────────────────────────────────────────────────────────────────────────────
+# 3) oauth_pending: apply tokens/URLs, then mark consumed
+# ──────────────────────────────────────────────────────────────────────────────
+
 apply_oauth_pending() {
     local key="$1"
     local val="$2"
