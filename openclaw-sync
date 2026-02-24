@@ -31,6 +31,12 @@ OPENCLAW_API_BASE="${OPENCLAW_API_BASE%/}"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
+# systemd services often have empty HOME — resolve from /etc/passwd
+if [ -z "$HOME" ]; then
+    HOME="$(getent passwd "$(whoami)" 2>/dev/null | cut -d: -f6)" || HOME="/root"
+    export HOME
+fi
+
 OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
 DEVICE_CODE_STATE_DIR="/tmp/openclaw-sync-device-codes"
 RESTART_FLAG="/tmp/openclaw-sync-gateway-restarted"
