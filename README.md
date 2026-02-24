@@ -74,6 +74,26 @@ The timer should be `active`; logs should show no token or network errors.
 
 ---
 
+## Deploying to a new server (checklist)
+
+When you roll this out to each new server, do the following once per server:
+
+1. **Install OpenClaw** on the server (gateway + CLI), start the gateway, ensure it listens on the chosen port (e.g. 18789).
+2. **Clone this repo**, create `env` from `env.example`, set `OPENCLAW_CONFIG_TOKEN` (and optionally `OPENCLAW_API_BASE`). Run `sudo ./install.sh`.
+3. **One-time pairing** so the sync script (and CLI) can talk to the gateway:
+   - The first time the script or `openclaw` CLI connects to the gateway, the gateway may respond with **pairing required**. Open the gateway in a browser **on that server**: `http://127.0.0.1:18789/` (if you’re remote, use an SSH tunnel: `ssh -L 18789:127.0.0.1:18789 root@server` then open `http://localhost:18789/`).
+   - In the dashboard, approve the pending device (the one used by the sync/CLI). After that, the script and CLI will connect without asking again.
+4. Optionally run the sync once by hand to confirm: `./openclaw-sync`.
+
+No need to repeat pairing unless you revoke the device or reinstall OpenClaw state.
+
+**Pairing / allowInsecureAuth**  
+The sync script sets `gateway.controlUi.allowInsecureAuth true` in the OpenClaw config at each run so that the CLI (and script) can connect without manual device pairing. This only makes sense when the gateway is bound to loopback (`127.0.0.1`) and not exposed to the network. **After first deploy**, restart the OpenClaw gateway once so the setting takes effect: `openclaw gateway restart`.  
+
+**Security:** `allowInsecureAuth` disables device identity and pairing. Use only when the gateway is not exposed (loopback or trusted host). Do not use on a publicly reachable port.
+
+---
+
 ## Updating: pull from GitHub and restart
 
 Go to the repo directory, pull, then restart the timer:
@@ -114,3 +134,28 @@ sudo ./update.sh
 API keys (env) are only sent in the config; OpenClaw receives them through the same config.patch when agents_defaults is applied. No extra step needed for API-key-only providers.
 
 Token and API base are read from the `env` file in the repo root (see `env.example`).
+
+---
+
+## Troubleshooting
+
+**How to see which user runs the OpenClaw gateway**
+
+- By process (default port 18789):
+  ```bash
+  lsof -nP -iTCP:18789 -sTCP:LISTEN
+  ```
+  or:
+  ```bash
+  ss -tlnp | grep 18789
+  ```
+  Then check the process owner: `ps -o user= -p <PID>`.
+
+- By systemd: if the gateway is a **user** service, the unit is under `~/.config/systemd/user/` and you'd use `systemctl --user status openclaw-gateway` (as that user). If it's a **system** service, `systemctl status openclaw-gateway` (often as root) and the unit is under `/etc/systemd/system/`.
+
+- One-liner to print the gateway process user:
+  ```bash
+  ps -o user= -p $(lsof -t -iTCP:18789 -sTCP:LISTEN 2>/dev/null) 2>/dev/null || echo "No listener on 18789"
+  ```
+
+If the script restarts the gateway after enabling a plugin, it uses `openclaw gateway stop`, waits for the port to be free, then `openclaw gateway start`. If you see "pairing required" after a restart, open the gateway URL (e.g. http://127.0.0.1:18789/) and complete pairing for the CLI device; see [OpenClaw troubleshooting](https://docs.openclaw.ai/troubleshooting).

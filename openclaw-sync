@@ -65,6 +65,11 @@ fi
 
 RESP="$RESP_BODY"
 
+# Ensure gateway allows local CLI connections without pairing (loopback-only safe). Takes effect after next gateway restart.
+if command -v openclaw &>/dev/null; then
+    openclaw config set gateway.controlUi.allowInsecureAuth true 2>/dev/null || true
+fi
+
 # --- 1) Apply agents_defaults and tools_web_search (enables models for configured providers) ---
 AGENTS_DEFAULTS="$(echo "$RESP" | jq -c '.agents_defaults // empty' 2>/dev/null)" || AGENTS_DEFAULTS=""
 TOOLS_WEB_SEARCH="$(echo "$RESP" | jq -c '.tools_web_search // empty' 2>/dev/null)" || TOOLS_WEB_SEARCH=""
@@ -131,11 +136,29 @@ done <<< "$OAUTH_URL_REQUESTS_RAW"
 
 if [ "$NEED_GATEWAY_RESTART" = "1" ]; then
     echo "Restarting OpenClaw gateway to apply plugin(s)..." >&2
-    if openclaw gateway restart 2>/dev/null; then
-        echo "Waiting for gateway to come back (10s)..." >&2
-        sleep 10
+    openclaw gateway stop 2>/dev/null || true
+    # Wait for port 18789 to be free (avoid "port already in use" on start)
+    GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if ! (lsof -nP -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN 2>/dev/null | grep -q .); then
+            break
+        fi
+        [ "$i" -eq 1 ] && echo "Waiting for gateway port $GATEWAY_PORT to be free..." >&2
+        sleep 1
+    done
+    if openclaw gateway start 2>/dev/null; then
+        echo "Waiting for gateway to become ready..." >&2
+        sleep 15
+        for wait_i in 1 2 3 4 5 6 7 8 9 10; do
+            if openclaw gateway call config.get --params '{}' 2>/dev/null | jq -e '.payload.hash // .hash' >/dev/null 2>&1; then
+                echo "Gateway ready." >&2
+                break
+            fi
+            [ "$wait_i" -eq 10 ] && echo "Warning: gateway RPC still not responding after wait." >&2
+            sleep 3
+        done
     else
-        echo "Warning: gateway restart failed or not available; run 'openclaw gateway restart' manually if needed." >&2
+        echo "Warning: gateway start failed; run 'openclaw gateway stop' then 'openclaw gateway start' manually." >&2
     fi
 fi
 
