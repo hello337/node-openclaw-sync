@@ -229,28 +229,14 @@ save_qwen_token() {
         || { echo "qwen_portal: failed to save profile" >&2; return 1; }
     echo "qwen_portal: saved OAuth token" >&2
 
-    local base_url="https://portal.qwen.ai/v1"
-    [ -n "$resource_url" ] && [ "$resource_url" != "null" ] && base_url="$resource_url"
-    base_url="$(echo "$base_url" | sed 's|/*$||')"
-    echo "$base_url" | grep -q '/v1$' || base_url="${base_url}/v1"
-
     local cfg
-    cfg="$(jq -n --arg bu "$base_url" '{
+    cfg="$(jq -n '{
         auth: {
             profiles: {
                 "qwen-portal:default": { provider: "qwen-portal", mode: "oauth" }
             },
             order: { "qwen-portal": ["qwen-portal:default"] }
         },
-        models: { providers: { "qwen-portal": {
-            baseUrl: $bu, apiKey: "qwen-oauth", api: "openai-completions",
-            models: [
-                { id: "coder-model", name: "Qwen Coder", reasoning: false, input: ["text"],
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 },
-                { id: "vision-model", name: "Qwen Vision", reasoning: false, input: ["text","image"],
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 }
-            ]
-        }}},
         agents: { defaults: {
             model: { primary: "qwen-portal/coder-model" },
             models: {
@@ -543,15 +529,6 @@ save_gemini_cli_token() {
             },
             order: { "google-gemini-cli": ["google-gemini-cli:default"] }
         },
-        models: { providers: { "google-gemini-cli": {
-            apiKey: "gemini-cli-oauth", api: "gemini",
-            models: [
-                { id: "gemini-3-pro-preview", name: "Gemini 3 Pro", reasoning: true, input: ["text","image"],
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 65536 },
-                { id: "gemini-3-flash-preview", name: "Gemini 3 Flash", reasoning: false, input: ["text","image"],
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 65536 }
-            ]
-        }}},
         agents: { defaults: {
             model: { primary: "google-gemini-cli/gemini-3-pro-preview" },
             models: {
@@ -570,6 +547,27 @@ save_gemini_cli_token() {
     fi
     return 0
 }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gateway init: allowInsecureAuth + enable bundled auth plugins (once)
+# ──────────────────────────────────────────────────────────────────────────────
+
+GATEWAY_INIT_FLAG="/tmp/openclaw-sync-gateway-init-done"
+if command -v openclaw &>/dev/null; then
+    if [ ! -f "$GATEWAY_INIT_FLAG" ]; then
+        echo "gateway_init: first run — configuring plugins and settings" >&2
+        openclaw config set gateway.controlUi.allowInsecureAuth true 2>/dev/null || true
+        for _plugin in qwen-portal-auth copilot-proxy google-gemini-cli-auth minimax-portal-auth; do
+            openclaw plugins enable "$_plugin" 2>/dev/null || true
+        done
+        openclaw gateway stop 2>/dev/null || true
+        sleep 3
+        openclaw gateway start 2>/dev/null || true
+        touch "$GATEWAY_INIT_FLAG"
+        echo "gateway_init: plugins enabled, gateway restarted" >&2
+    fi
+    openclaw gateway health --timeout 15000 2>/dev/null || true
+fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Phase 0: Retry pending config patches + poll pending device-code flows
@@ -692,8 +690,6 @@ RESP_BODY="$(echo "$RESP" | sed '$d')"
 if [ "$HTTP_CODE" != "200" ]; then echo "Failed to fetch config: HTTP $HTTP_CODE" >&2; exit 1; fi
 if ! echo "$RESP_BODY" | jq -e . >/dev/null 2>&1; then echo "Config response is not valid JSON" >&2; exit 1; fi
 RESP="$RESP_BODY"
-
-command -v openclaw &>/dev/null && openclaw config set gateway.controlUi.allowInsecureAuth true 2>/dev/null || true
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) Write API keys to ~/.openclaw/.env + apply config via config.patch
