@@ -39,6 +39,8 @@ PROFILES_FILE="$OPENCLAW_STATE_DIR/agents/main/agent/auth-profiles.json"
 # Track whether a full gateway restart is needed (auth-profiles.json changed)
 OAUTH_TOKEN_SAVED=0
 
+echo "env: HOME=$HOME OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR PROFILES_FILE=$PROFILES_FILE" >&2
+
 if ! command -v jq &>/dev/null; then echo "jq is required." >&2; exit 1; fi
 if ! command -v openssl &>/dev/null; then echo "openssl is required." >&2; exit 1; fi
 
@@ -129,6 +131,11 @@ retry_pending_configs() {
 
 save_auth_profile() {
     local profile_id="$1" profile_json="$2"
+    local dir
+    dir="$(dirname "$PROFILES_FILE")"
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        echo "save_auth_profile: FAILED to create dir $dir" >&2; return 1
+    fi
     local existing='{"version":1,"profiles":{}}'
     if [ -f "$PROFILES_FILE" ]; then
         existing="$(jq -c '.' "$PROFILES_FILE" 2>/dev/null)" || existing='{"version":1,"profiles":{}}'
@@ -141,9 +148,18 @@ save_auth_profile() {
     fi
     local updated
     updated="$(echo "$existing" | jq --arg pid "$profile_id" --argjson prof "$profile_json" \
-        '.profiles[$pid] = $prof' 2>/dev/null)" || return 1
-    mkdir -p "$(dirname "$PROFILES_FILE")"
-    echo "$updated" > "$PROFILES_FILE"
+        '.profiles[$pid] = $prof')" || { echo "save_auth_profile: jq merge failed for $profile_id" >&2; return 1; }
+    if [ -z "$updated" ]; then
+        echo "save_auth_profile: jq produced empty output for $profile_id" >&2; return 1
+    fi
+    echo "$updated" > "$PROFILES_FILE" || { echo "save_auth_profile: FAILED to write $PROFILES_FILE" >&2; return 1; }
+    chmod 600 "$PROFILES_FILE" 2>/dev/null || true
+    if [ -f "$PROFILES_FILE" ]; then
+        echo "save_auth_profile: OK — wrote $PROFILES_FILE ($(wc -c < "$PROFILES_FILE") bytes)" >&2
+    else
+        echo "save_auth_profile: CRITICAL — file not found after write: $PROFILES_FILE" >&2
+        return 1
+    fi
 }
 
 apply_provider_config_patch() {
@@ -214,7 +230,15 @@ extract_url_param() {
 # won't be picked up without a full restart.
 full_gateway_restart() {
     command -v openclaw &>/dev/null || return 0
-    echo "full_gateway_restart: stopping gateway to reload auth-profiles.json..." >&2
+
+    # Backup auth-profiles.json before restart (gateway might reset it)
+    local BACKUP=""
+    if [ -f "$PROFILES_FILE" ]; then
+        BACKUP="$(cat "$PROFILES_FILE" 2>/dev/null)"
+        echo "full_gateway_restart: backed up auth-profiles.json ($(wc -c < "$PROFILES_FILE") bytes)" >&2
+    fi
+
+    echo "full_gateway_restart: stopping gateway..." >&2
     openclaw gateway stop 2>/dev/null || true
     local GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
     local i
@@ -222,10 +246,32 @@ full_gateway_restart() {
         (lsof -nP -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN 2>/dev/null | grep -q .) || break
         sleep 1
     done
+
+    # Restore auth-profiles.json if gateway deleted it
+    if [ -n "$BACKUP" ] && [ ! -f "$PROFILES_FILE" ]; then
+        echo "full_gateway_restart: auth-profiles.json was DELETED by gateway stop, restoring..." >&2
+        mkdir -p "$(dirname "$PROFILES_FILE")"
+        echo "$BACKUP" > "$PROFILES_FILE"
+        chmod 600 "$PROFILES_FILE" 2>/dev/null || true
+    fi
+
     echo "full_gateway_restart: starting gateway..." >&2
     openclaw gateway start 2>/dev/null || true
     openclaw gateway health --timeout 20000 2>/dev/null || true
-    echo "full_gateway_restart: done" >&2
+
+    # Verify auth-profiles.json still exists after start
+    if [ -n "$BACKUP" ] && [ ! -f "$PROFILES_FILE" ]; then
+        echo "full_gateway_restart: auth-profiles.json was DELETED by gateway start, restoring..." >&2
+        mkdir -p "$(dirname "$PROFILES_FILE")"
+        echo "$BACKUP" > "$PROFILES_FILE"
+        chmod 600 "$PROFILES_FILE" 2>/dev/null || true
+    fi
+
+    if [ -f "$PROFILES_FILE" ]; then
+        echo "full_gateway_restart: done (auth-profiles.json: $(wc -c < "$PROFILES_FILE") bytes)" >&2
+    else
+        echo "full_gateway_restart: done (WARNING: no auth-profiles.json at $PROFILES_FILE)" >&2
+    fi
 }
 
 # true if this provider is handled via direct API (not CLI)
@@ -270,9 +316,11 @@ save_qwen_token() {
 
     local base_url="https://portal.qwen.ai/v1"
     if [ -n "$resource_url" ] && [ "$resource_url" != "null" ]; then
-        base_url="$(echo "$resource_url" | sed 's|/*$||')"
+        base_url="$(echo "$resource_url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's|/*$||')"
+        echo "$base_url" | grep -qE '^https?://' || base_url="https://${base_url}"
         echo "$base_url" | grep -q '/v1$' || base_url="${base_url}/v1"
     fi
+    echo "qwen_portal: using baseUrl=$base_url" >&2
 
     local cfg
     cfg="$(jq -n --arg bu "$base_url" '{
@@ -398,7 +446,11 @@ save_minimax_token() {
     echo "minimax_portal: saved OAuth token to $PROFILES_FILE" >&2
 
     local base_url="https://api.minimax.io/anthropic"
-    [ -n "$resource_url" ] && [ "$resource_url" != "null" ] && base_url="$resource_url"
+    if [ -n "$resource_url" ] && [ "$resource_url" != "null" ]; then
+        base_url="$(echo "$resource_url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's|/*$||')"
+        echo "$base_url" | grep -qE '^https?://' || base_url="https://${base_url}"
+    fi
+    echo "minimax_portal: using baseUrl=$base_url" >&2
     local cfg
     cfg="$(jq -n --arg bu "$base_url" '{
         auth: {
@@ -626,6 +678,46 @@ if command -v openclaw &>/dev/null; then
     fi
     openclaw gateway health --timeout 15000 2>/dev/null || true
 fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pre-Phase 0: Fix provider baseUrl missing https:// protocol
+# ──────────────────────────────────────────────────────────────────────────────
+
+fix_provider_base_urls() {
+    command -v openclaw &>/dev/null || return 0
+    local GET_RESP FIXES=""
+    GET_RESP="$(gateway_call_json config.get --params '{}')" || return 0
+    [ -z "$GET_RESP" ] && return 0
+    local providers_json
+    providers_json="$(echo "$GET_RESP" | jq -c '.config.models.providers // {}' 2>/dev/null)" || return 0
+    [ "$providers_json" = "{}" ] || [ "$providers_json" = "null" ] && return 0
+
+    while IFS='=' read -r prov burl; do
+        [ -z "$prov" ] || [ -z "$burl" ] && continue
+        if ! echo "$burl" | grep -qE '^https?://'; then
+            local fixed="https://${burl}"
+            echo "fix_base_urls: $prov baseUrl '$burl' → '$fixed'" >&2
+            FIXES="$(echo "${FIXES:-{\}}" | jq --arg p "$prov" --arg u "$fixed" \
+                '.models.providers[$p].baseUrl = $u' 2>/dev/null)" || continue
+        fi
+    done < <(echo "$providers_json" | jq -r 'to_entries[] | select(.value.baseUrl != null) | "\(.key)=\(.value.baseUrl)"' 2>/dev/null)
+
+    if [ -n "$FIXES" ] && [ "$FIXES" != "{}" ]; then
+        local HASH
+        HASH="$(echo "$GET_RESP" | jq -r '.hash // empty' 2>/dev/null)"
+        if [ -n "$HASH" ]; then
+            local FIX_RAW FIX_PARAMS
+            FIX_RAW="$(echo "$FIXES" | jq -c '.' 2>/dev/null)"
+            FIX_PARAMS="$(jq -n --arg h "$HASH" --arg r "$FIX_RAW" '{ baseHash: $h, raw: $r }' 2>/dev/null)"
+            if gateway_call_json config.patch --params "$FIX_PARAMS" >/dev/null 2>&1; then
+                echo "fix_base_urls: patched successfully" >&2
+            else
+                echo "fix_base_urls: patch failed" >&2
+            fi
+        fi
+    fi
+}
+fix_provider_base_urls
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Phase 0: Retry pending config patches + poll pending device-code flows
