@@ -164,12 +164,15 @@ while IFS= read -r KEY || [ -n "$KEY" ]; do
         echo "oauth_url_requests.$KEY: openclaw not in PATH" >&2
         continue
     fi
-    OUT="$(run_with_timeout 25 openclaw models auth login --provider "$PROVIDER" 2>&1)" || true
+    OUT="$(run_with_timeout 45 openclaw models auth login --provider "$PROVIDER" 2>&1)" || true
     if echo "$OUT" | grep -qi "no provider plugins found"; then
         echo "oauth_url_requests.$KEY: Enable the plugin (e.g. openclaw plugins enable qwen-portal-auth), restart the OpenClaw gateway, then run this script again." >&2
         continue
     fi
+    # Extract URL: common patterns (https, verification_uri in JSON, Open/Visit lines)
     AUTH_URL="$(echo "$OUT" | grep -oE 'https://[^ )[\]"'\''<>]+' | head -1)"
+    [ -z "$AUTH_URL" ] && AUTH_URL="$(echo "$OUT" | grep -oE '"verification_uri"[[:space:]]*:[[:space:]]*"[^"]+"' | sed 's/.*"\(https\?:[^"]*\)".*/\1/' | head -1)"
+    [ -z "$AUTH_URL" ] && AUTH_URL="$(echo "$OUT" | grep -oE 'https?://[^ )[\]"'\''<>]+' | head -1)"
     if [ -n "$AUTH_URL" ]; then
         POST_BODY="$(jq -n --arg k "$KEY" --arg u "$AUTH_URL" '{ key: $k, auth_url: $u }' 2>/dev/null)" || true
         if [ -n "$POST_BODY" ]; then
@@ -182,13 +185,13 @@ while IFS= read -r KEY || [ -n "$KEY" ]; do
             if [ "$POST_CODE" = "200" ] && echo "$POST_RESP" | sed '$d' | jq -e '.ok' >/dev/null 2>&1; then
                 echo "oauth_url_requests.$KEY: auth URL sent to xNode" >&2
             else
-                echo "oauth_url_requests.$KEY: failed to POST auth URL (HTTP $POST_CODE)" >&2
+                echo "oauth_url_requests.$KEY: failed to POST auth URL (HTTP $POST_CODE). Ensure OPENCLAW_API_BASE ($OPENCLAW_API_BASE) is the same API your frontend uses." >&2
             fi
         else
             echo "oauth_url_requests.$KEY: failed to build request body" >&2
         fi
     else
-        echo "oauth_url_requests.$KEY: no URL in output. If you just enabled a plugin, restart the OpenClaw gateway and run this script again. Or run manually: openclaw models auth login --provider $PROVIDER" >&2
+        echo "oauth_url_requests.$KEY: no URL in output. Run manually on the server: openclaw models auth login --provider $PROVIDER (check if a URL is printed). Ensure OPENCLAW_API_BASE points to the same API as your frontend." >&2
     fi
 done <<< "$OAUTH_URL_REQUESTS_RAW"
 

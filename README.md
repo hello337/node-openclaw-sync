@@ -159,3 +159,9 @@ Token and API base are read from the `env` file in the repo root (see `env.examp
   ```
 
 When the script enables a plugin and restarts the gateway, it exits right after `openclaw gateway start` and does **not** fetch the auth URL in the same run. The next run (e.g. in ~10s via the timer) will fetch the URL once the gateway is ready. This avoids a known OpenClaw issue where the gateway needs more than a few seconds to become healthy after restart ([openclaw/openclaw#22972](https://github.com/openclaw/openclaw/issues/22972)).
+
+**"Waiting for link" never shows the link**
+
+1. **OPENCLAW_API_BASE** must be the **exact same API** your frontend and browser use. If the frontend talks to `https://api.xnode.pro`, the script's `env` must have `OPENCLAW_API_BASE=https://api.xnode.pro` (no trailing slash). If you use a custom backend or ngrok for local dev, set that URL in the script's `env` on the machine where the script runs; otherwise the script posts the URL to a different backend and the frontend never sees it.
+2. Run the script **by hand** on the server: `./openclaw-sync`. Look for either `oauth_url_requests.qwen_portal: auth URL sent to xNode` (success) or `no URL in output` / `failed to POST`. If you see "no URL in output", run `openclaw models auth login --provider qwen-portal` manually on the server and check whether a URL is printed; if it only works in an interactive terminal, the gateway may need more time after restart (wait 20–30s and run the script again).
+3. Ensure the **config token** in the script's `env` is the one from the same OpenClaw node that the user is configuring in the UI (Pending Nodes → Token).
