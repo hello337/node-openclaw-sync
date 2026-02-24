@@ -71,21 +71,9 @@ run_with_timeout() {
     else "$@" 2>&1; fi
 }
 
-# openclaw gateway call outputs "Gateway call: <method>" on stdout before JSON.
-# This helper strips all non-JSON prefix lines so jq can parse the result.
+# Use --json flag for machine-parseable output (no banner, no ANSI codes).
 gateway_call_json() {
-    local raw
-    raw="$(openclaw gateway call "$@" 2>/dev/null)" || return 1
-    [ -z "$raw" ] && return 1
-    # Try strict match (JSON at line start), then relaxed (optional whitespace)
-    local json
-    json="$(echo "$raw" | sed -n '/^[[:space:]]*[{[]/,$p')"
-    if [ -n "$json" ]; then
-        echo "$json"
-    else
-        # Last resort: strip everything before the first { on ANY line
-        echo "$raw" | awk '/{/{found=1} found'
-    fi
+    openclaw gateway call --json "$@" 2>/dev/null
 }
 
 generate_pkce() {
@@ -155,7 +143,7 @@ apply_provider_config_patch() {
         echo "apply_provider_config_patch: config.get returned empty response" >&2; return 1
     fi
 
-    HASH="$(echo "$GET_RESP" | jq -r '.payload.hash // .hash // .configHash // empty' 2>/dev/null)" || HASH=""
+    HASH="$(echo "$GET_RESP" | jq -r '.hash // empty' 2>/dev/null)" || HASH=""
     if [ -z "$HASH" ]; then
         local resp_keys
         resp_keys="$(echo "$GET_RESP" | jq -r 'keys | join(", ")' 2>/dev/null)" || resp_keys="(not valid json)"
@@ -242,20 +230,27 @@ save_qwen_token() {
 
     local base_url="https://portal.qwen.ai/v1"
     if [ -n "$resource_url" ] && [ "$resource_url" != "null" ]; then
-        base_url="$resource_url"
-        base_url="$(echo "$base_url" | sed 's|/*$||')"
+        base_url="$(echo "$resource_url" | sed 's|/*$||')"
         echo "$base_url" | grep -q '/v1$' || base_url="${base_url}/v1"
     fi
 
     local cfg
     cfg="$(jq -n --arg bu "$base_url" '{
         auth: {
-            profiles: {
-                "qwen-portal:default": { provider: "qwen-portal", mode: "oauth" }
-            },
+            profiles: { "qwen-portal:default": { provider: "qwen-portal", mode: "oauth" } },
             order: { "qwen-portal": ["qwen-portal:default"] }
         },
-        models: { providers: { "qwen-portal": { baseUrl: $bu } } },
+        models: { providers: { "qwen-portal": {
+            baseUrl: $bu,
+            apiKey: "qwen-oauth",
+            api: "openai-completions",
+            models: [
+                { id: "coder-model", name: "Qwen Coder", reasoning: false, input: ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 },
+                { id: "vision-model", name: "Qwen Vision", reasoning: false, input: ["text","image"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 }
+            ]
+        }}},
         agents: { defaults: {
             model: { primary: "qwen-portal/coder-model" },
             models: {
@@ -759,7 +754,7 @@ if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
     GET_RESP_MAIN="$(gateway_call_json config.get --params '{}')" || GET_RESP_MAIN=""
     HASH=""
     if [ -n "$GET_RESP_MAIN" ]; then
-        HASH="$(echo "$GET_RESP_MAIN" | jq -r '.payload.hash // .hash // .configHash // empty' 2>/dev/null)" || HASH=""
+        HASH="$(echo "$GET_RESP_MAIN" | jq -r '.hash // empty' 2>/dev/null)" || HASH=""
         if [ -z "$HASH" ]; then
             _keys="$(echo "$GET_RESP_MAIN" | jq -r 'keys | join(", ")' 2>/dev/null)" || _keys="?"
             echo "Warning: config.get returned JSON but no hash field (keys: $_keys)" >&2
