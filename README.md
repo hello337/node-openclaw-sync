@@ -158,4 +158,4 @@ Token and API base are read from the `env` file in the repo root (see `env.examp
   ps -o user= -p $(lsof -t -iTCP:18789 -sTCP:LISTEN 2>/dev/null) 2>/dev/null || echo "No listener on 18789"
   ```
 
-If the script restarts the gateway after enabling a plugin, it uses `openclaw gateway stop`, waits for the port to be free, then `openclaw gateway start`. If you see "pairing required" after a restart, open the gateway URL (e.g. http://127.0.0.1:18789/) and complete pairing for the CLI device; see [OpenClaw troubleshooting](https://docs.openclaw.ai/troubleshooting).
+When the script enables a plugin and restarts the gateway, it exits right after `openclaw gateway start` and does **not** fetch the auth URL in the same run. The next run (e.g. in ~10s via the timer) will fetch the URL once the gateway is ready. This avoids a known OpenClaw issue where the gateway needs more than a few seconds to become healthy after restart ([openclaw/openclaw#22972](https://github.com/openclaw/openclaw/issues/22972)).

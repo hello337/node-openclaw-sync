@@ -134,10 +134,11 @@ while IFS= read -r KEY || [ -n "$KEY" ]; do
     fi
 done <<< "$OAUTH_URL_REQUESTS_RAW"
 
+# OpenClaw issue #22972: health check times out on slow startups (~10s+ with plugins).
+# So when we restart here, we do NOT run Phase B in the same run — exit and let the next run (~10s later) fetch the auth URL when the gateway is ready.
 if [ "$NEED_GATEWAY_RESTART" = "1" ]; then
     echo "Restarting OpenClaw gateway to apply plugin(s)..." >&2
     openclaw gateway stop 2>/dev/null || true
-    # Wait for port 18789 to be free (avoid "port already in use" on start)
     GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
     for i in 1 2 3 4 5 6 7 8 9 10; do
         if ! (lsof -nP -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN 2>/dev/null | grep -q .); then
@@ -147,16 +148,8 @@ if [ "$NEED_GATEWAY_RESTART" = "1" ]; then
         sleep 1
     done
     if openclaw gateway start 2>/dev/null; then
-        echo "Waiting for gateway to become ready..." >&2
-        sleep 15
-        for wait_i in 1 2 3 4 5 6 7 8 9 10; do
-            if openclaw gateway call config.get --params '{}' 2>/dev/null | jq -e '.payload.hash // .hash' >/dev/null 2>&1; then
-                echo "Gateway ready." >&2
-                break
-            fi
-            [ "$wait_i" -eq 10 ] && echo "Warning: gateway RPC still not responding after wait." >&2
-            sleep 3
-        done
+        echo "Gateway restarted; auth URL will be fetched on next run (in ~10s)." >&2
+        exit 0
     else
         echo "Warning: gateway start failed; run 'openclaw gateway stop' then 'openclaw gateway start' manually." >&2
     fi
