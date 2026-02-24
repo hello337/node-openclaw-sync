@@ -3,37 +3,25 @@
 # OpenClaw <-> xNode sync: fetches config from xNode API and applies it to the local
 # OpenClaw instance (agents_defaults, tools_web_search, oauth_url_requests, oauth_pending).
 #
-# Flow:
-# - API keys (env): sent in config, applied via config.patch so OpenClaw gets env and models.
-# - OAuth "request link": user clicks "Get auth link" -> we enable plugin if needed, run
-#   openclaw models auth login --provider X, capture URL, POST to xNode -> frontend shows link.
-# - OAuth "apply": user pastes callback URL or token -> we run login/paste-token with that
-#   value, then POST oauth-consumed. agents_defaults from API enables all models for that provider.
+# Supported auth flows (per provider):
+#   device-code (direct API — no CLI needed, fully reliable):
+#     - qwen_portal:    chat.qwen.ai PKCE device-code
+#     - github_copilot: github.com device flow (RFC 8628)
+#     - minimax_portal: api.minimax.io device-code with PKCE
+#   redirect OAuth (direct API — PKCE verifier persisted between runs):
+#     - openai_codex:        auth.openai.com PKCE redirect, client_id: app_EMoamEEZ73f0CkXaXp7hrann
+#     - google_gemini_cli:   accounts.google.com PKCE redirect, client_id extracted from Gemini CLI
+#   paste-token:
+#     - anthropic_setup_token: openclaw models auth paste-token
 #
-# Required env: OPENCLAW_CONFIG_TOKEN. Optional: OPENCLAW_API_BASE (default https://api.xnode.pro)
-# API: GET /openclaw/config, POST /openclaw/oauth-auth-url, POST /openclaw/oauth-consumed
-#
-# OpenClaw docs (verified):
-# - config.get / config.patch: docs.openclaw.ai/gateway/configuration
-# - agents.defaults: docs.openclaw.ai/gateway/configuration-examples
-# - tools.web.search: docs.openclaw.ai/gateway/configuration-reference
-# - Plugins & auth: docs.openclaw.ai/concepts/model-providers, concepts/oauth
-# - CLI models auth login: docs.openclaw.ai/cli/models
-#     IMPORTANT: requires interactive TTY to print device-code URL (GitHub #13192).
-#     We use `script -qec` to provide a pseudo-TTY from systemd.
-# - gateway start/stop: docs.openclaw.ai/cli/gateway — needs XDG_RUNTIME_DIR for user services.
-# - plugins enable/list: docs.openclaw.ai/cli/plugins — enable is idempotent; restart gateway to load.
-# - gateway health: docs.openclaw.ai/gateway/health — `openclaw gateway health` or `openclaw health`.
-#
+# Required env: OPENCLAW_CONFIG_TOKEN
+# Optional: OPENCLAW_API_BASE (default https://api.xnode.pro)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/env" ]; then
-    set -a
-    # shellcheck source=/dev/null
-    source "$SCRIPT_DIR/env"
-    set +a
+    set -a; source "$SCRIPT_DIR/env"; set +a
 fi
 
 : "${OPENCLAW_CONFIG_TOKEN:?Set OPENCLAW_CONFIG_TOKEN (from xNode admin: OpenClaw node -> Token)}"
@@ -43,10 +31,13 @@ OPENCLAW_API_BASE="${OPENCLAW_API_BASE%/}"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
-if ! command -v jq &>/dev/null; then
-    echo "jq is required." >&2
-    exit 1
-fi
+OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+DEVICE_CODE_STATE_DIR="/tmp/openclaw-sync-device-codes"
+RESTART_FLAG="/tmp/openclaw-sync-gateway-restarted"
+PROFILES_FILE="$OPENCLAW_STATE_DIR/agents/default/agent/auth-profiles.json"
+
+if ! command -v jq &>/dev/null; then echo "jq is required." >&2; exit 1; fi
+if ! command -v openssl &>/dev/null; then echo "openssl is required." >&2; exit 1; fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -54,23 +45,19 @@ fi
 
 plugin_for_key() {
     case "$1" in
-        google_antigravity) echo "google-antigravity-auth" ;;
         qwen_portal)        echo "qwen-portal-auth" ;;
         google_gemini_cli)  echo "google-gemini-cli-auth" ;;
         minimax_portal)     echo "minimax-portal-auth" ;;
-        *)                  echo "" ;;
+        *) echo "" ;;
     esac
 }
 
-provider_for_key() {
-    echo "$1" | sed 's/_/-/g'
-}
+provider_for_key() { echo "$1" | sed 's/_/-/g'; }
 
 strip_ansi() {
-    sed $'s/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b([0-9;]*[a-zA-Z]//g; s/\r//g'
+    sed $'s/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b([0-9;]*[a-zA-Z]//g; s/\x1b][^\x07\x1b]*[\x07]//g; s/\r//g'
 }
 
-# Detect pseudo-TTY support (Linux `script -qec`)
 HAS_SCRIPT_PTY=0
 if command -v script &>/dev/null; then
     if script -q -e -c "echo __pty_ok__" /dev/null 2>/dev/null | grep -q "__pty_ok__"; then
@@ -78,30 +65,443 @@ if command -v script &>/dev/null; then
     fi
 fi
 
-# Run a command with a timeout. If we have `script`, wrap in a pseudo-TTY so
-# interactive CLIs (like openclaw models auth login) produce full output.
-run_with_pty() {
-    local t="$1"; shift
-    if [ "$HAS_SCRIPT_PTY" = "1" ]; then
-        local cmd
-        cmd="$(printf '%q ' "$@")"
-        timeout "$t" script -q -e -c "$cmd" /dev/null 2>&1 | strip_ansi
-    elif command -v timeout &>/dev/null; then
-        timeout "$t" "$@" 2>&1
-    else
-        "$@" 2>&1
-    fi
-}
-
-# Plain timeout wrapper (no PTY needed)
 run_with_timeout() {
     local t="$1"; shift
-    if command -v timeout &>/dev/null; then
-        timeout "$t" "$@" 2>&1
-    else
-        "$@" 2>&1
-    fi
+    if command -v timeout &>/dev/null; then timeout "$t" "$@" 2>&1
+    else "$@" 2>&1; fi
 }
+
+generate_pkce() {
+    local verifier challenge
+    verifier="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+    challenge="$(printf '%s' "$verifier" | openssl dgst -sha256 -binary | openssl base64 | tr '+/' '-_' | tr -d '=')"
+    echo "$verifier $challenge"
+}
+
+save_state() {
+    local key="$1"; shift
+    mkdir -p "$DEVICE_CODE_STATE_DIR"
+    jq -n "$@" > "$DEVICE_CODE_STATE_DIR/$key.json"
+}
+
+save_auth_profile() {
+    local profile_id="$1" profile_json="$2"
+    local existing="{}"
+    [ -f "$PROFILES_FILE" ] && { existing="$(jq -c '.' "$PROFILES_FILE" 2>/dev/null)" || existing="{}"; }
+    local updated
+    updated="$(echo "$existing" | jq --arg pid "$profile_id" --argjson prof "$profile_json" \
+        '. + { ($pid): $prof }' 2>/dev/null)" || return 1
+    mkdir -p "$(dirname "$PROFILES_FILE")"
+    echo "$updated" > "$PROFILES_FILE"
+}
+
+apply_provider_config_patch() {
+    local provider_config_json="$1"
+    command -v openclaw &>/dev/null || return 0
+    local HASH
+    HASH="$(openclaw gateway call config.get --params '{}' 2>/dev/null | jq -r '.payload.hash // .hash // empty' 2>/dev/null)" || HASH=""
+    [ -z "$HASH" ] && return 0
+    local PARAMS
+    PARAMS="$(jq -n --arg h "$HASH" --arg r "$provider_config_json" '{ baseHash: $h, raw: $r }' 2>/dev/null)" || return 0
+    openclaw gateway call config.patch --params "$PARAMS" 2>/dev/null || return 1
+}
+
+post_oauth_consumed() {
+    local key="$1"
+    curl -s -w "\n%{http_code}" -X POST \
+        -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"keys\": [\"$key\"]}" \
+        "$OPENCLAW_API_BASE/openclaw/oauth-consumed" 2>/dev/null || true
+}
+
+url_decode() {
+    printf '%b' "$(echo "$1" | sed 's/+/ /g; s/%\([0-9a-fA-F][0-9a-fA-F]\)/\\x\1/g')"
+}
+
+extract_url_param() {
+    local url="$1" param="$2"
+    local val
+    val="$(echo "$url" | grep -oE "[?&]${param}=([^&]*)" | head -1 | sed "s/[?&]${param}=//")"
+    [ -n "$val" ] && url_decode "$val"
+}
+
+# true if this provider is handled via direct API (not CLI)
+is_self_handled_provider() {
+    case "$1" in
+        qwen_portal|github_copilot|minimax_portal) return 0 ;; # device-code
+        openai_codex|google_gemini_cli) return 0 ;; # redirect (direct)
+        *) return 1 ;;
+    esac
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Provider: Qwen Portal (device-code with PKCE)
+# ──────────────────────────────────────────────────────────────────────────────
+
+QWEN_CLIENT_ID="f0304373b74a44d2b584a3fb70ca9e56"
+QWEN_DEVICE_CODE_URL="https://chat.qwen.ai/api/v1/oauth2/device/code"
+QWEN_TOKEN_URL="https://chat.qwen.ai/api/v1/oauth2/token"
+
+qwen_request_device_code() {
+    local challenge="$1"
+    curl -s -w "\n%{http_code}" -X POST "$QWEN_DEVICE_CODE_URL" \
+        -H "Content-Type: application/x-www-form-urlencoded" -H "Accept: application/json" \
+        -d "client_id=${QWEN_CLIENT_ID}&scope=openid+profile+email+model.completion&code_challenge=${challenge}&code_challenge_method=S256"
+}
+
+qwen_poll_token() {
+    local device_code="$1" verifier="$2"
+    curl -s -w "\n%{http_code}" -X POST "$QWEN_TOKEN_URL" \
+        -H "Content-Type: application/x-www-form-urlencoded" -H "Accept: application/json" \
+        -d "grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=${QWEN_CLIENT_ID}&device_code=${device_code}&code_verifier=${verifier}"
+}
+
+save_qwen_token() {
+    local access="$1" refresh="$2" expires="$3" resource_url="$4"
+    save_auth_profile "qwen-portal:default" \
+        "$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" \
+        '{ type: "oauth", provider: "qwen-portal", access: $a, refresh: $r, expires: $e }')" \
+        || { echo "qwen_portal: failed to save profile" >&2; return 1; }
+    echo "qwen_portal: saved OAuth token" >&2
+
+    local base_url="https://portal.qwen.ai/v1"
+    [ -n "$resource_url" ] && [ "$resource_url" != "null" ] && base_url="$resource_url"
+    base_url="$(echo "$base_url" | sed 's|/*$||')"
+    echo "$base_url" | grep -q '/v1$' || base_url="${base_url}/v1"
+
+    local cfg
+    cfg="$(jq -n --arg bu "$base_url" '{
+        models: { providers: { "qwen-portal": {
+            baseUrl: $bu, apiKey: "qwen-oauth", api: "openai-completions",
+            models: [
+                { id: "coder-model", name: "Qwen Coder", reasoning: false, input: ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 },
+                { id: "vision-model", name: "Qwen Vision", reasoning: false, input: ["text","image"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 }
+            ]
+        }}}
+    }' 2>/dev/null)" || true
+    [ -n "$cfg" ] && apply_provider_config_patch "$cfg" && echo "qwen_portal: config.patch applied" >&2
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Provider: GitHub Copilot (device-code, no PKCE)
+# ──────────────────────────────────────────────────────────────────────────────
+
+GH_CLIENT_ID="Iv1.b507a08c87ecfe98"
+GH_DEVICE_CODE_URL="https://github.com/login/device/code"
+GH_TOKEN_URL="https://github.com/login/oauth/access_token"
+
+gh_request_device_code() {
+    curl -s -w "\n%{http_code}" -X POST "$GH_DEVICE_CODE_URL" \
+        -H "Content-Type: application/x-www-form-urlencoded" -H "Accept: application/json" \
+        -d "client_id=${GH_CLIENT_ID}&scope=read:user"
+}
+
+gh_poll_token() {
+    local device_code="$1"
+    curl -s -w "\n%{http_code}" -X POST "$GH_TOKEN_URL" \
+        -H "Content-Type: application/x-www-form-urlencoded" -H "Accept: application/json" \
+        -d "client_id=${GH_CLIENT_ID}&device_code=${device_code}&grant_type=urn:ietf:params:oauth:grant-type:device_code"
+}
+
+save_github_copilot_token() {
+    local token="$1"
+    save_auth_profile "github-copilot:github" \
+        "$(jq -n --arg t "$token" '{ type: "token", provider: "github-copilot", token: $t }')" \
+        || { echo "github_copilot: failed to save profile" >&2; return 1; }
+    echo "github_copilot: saved GitHub token" >&2
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Provider: MiniMax Portal (device-code with PKCE + state)
+# ──────────────────────────────────────────────────────────────────────────────
+
+MM_CLIENT_ID="78257093-7e40-4613-99e0-527b14b39113"
+MM_CODE_URL="https://api.minimax.io/oauth/code"
+MM_TOKEN_URL="https://api.minimax.io/oauth/token"
+
+mm_request_device_code() {
+    local challenge="$1" state="$2"
+    curl -s -w "\n%{http_code}" -X POST "$MM_CODE_URL" \
+        -H "Content-Type: application/x-www-form-urlencoded" -H "Accept: application/json" \
+        -H "x-request-id: $(openssl rand -hex 16)" \
+        -d "response_type=code&client_id=${MM_CLIENT_ID}&scope=group_id+profile+model.completion&code_challenge=${challenge}&code_challenge_method=S256&state=${state}"
+}
+
+mm_poll_token() {
+    local user_code="$1" verifier="$2"
+    curl -s -w "\n%{http_code}" -X POST "$MM_TOKEN_URL" \
+        -H "Content-Type: application/x-www-form-urlencoded" -H "Accept: application/json" \
+        -d "grant_type=urn:ietf:params:oauth:grant-type:user_code&client_id=${MM_CLIENT_ID}&user_code=${user_code}&code_verifier=${verifier}"
+}
+
+save_minimax_token() {
+    local access="$1" refresh="$2" expires="$3" resource_url="$4"
+    save_auth_profile "minimax-portal:default" \
+        "$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" \
+        '{ type: "oauth", provider: "minimax-portal", access: $a, refresh: $r, expires: $e }')" \
+        || { echo "minimax_portal: failed to save profile" >&2; return 1; }
+    echo "minimax_portal: saved OAuth token" >&2
+
+    local base_url="https://api.minimax.io/anthropic"
+    [ -n "$resource_url" ] && [ "$resource_url" != "null" ] && base_url="$resource_url"
+    local cfg
+    cfg="$(jq -n --arg bu "$base_url" '{
+        models: { providers: { "minimax-portal": {
+            baseUrl: $bu, apiKey: "minimax-oauth", api: "anthropic-messages",
+            models: [
+                { id: "MiniMax-M2.1", name: "MiniMax M2.1", reasoning: false, input: ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 8192 },
+                { id: "MiniMax-M2.5", name: "MiniMax M2.5", reasoning: true, input: ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 8192 }
+            ]
+        }}}
+    }' 2>/dev/null)" || true
+    [ -n "$cfg" ] && apply_provider_config_patch "$cfg" && echo "minimax_portal: config.patch applied" >&2
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Provider: OpenAI Codex (redirect OAuth with PKCE)
+# Source: @mariozechner/pi-ai → packages/ai/src/utils/oauth/openai-codex.ts
+# ──────────────────────────────────────────────────────────────────────────────
+
+OAI_CLIENT_ID="app_EMoamEEZ73f0CkXaXp7hrann"
+OAI_AUTH_URL="https://auth.openai.com/oauth/authorize"
+OAI_TOKEN_URL="https://auth.openai.com/oauth/token"
+OAI_REDIRECT_URI="http://localhost:1455/auth/callback"
+OAI_SCOPES="openid+profile+email+offline_access"
+
+oai_build_auth_url() {
+    local challenge="$1" state="$2"
+    echo "${OAI_AUTH_URL}?client_id=${OAI_CLIENT_ID}&response_type=code&redirect_uri=$(printf '%s' "$OAI_REDIRECT_URI" | jq -sRr @uri)&scope=${OAI_SCOPES}&code_challenge=${challenge}&code_challenge_method=S256&state=${state}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=pi"
+}
+
+oai_exchange_code() {
+    local code="$1" verifier="$2"
+    curl -s -w "\n%{http_code}" -X POST "$OAI_TOKEN_URL" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=authorization_code&client_id=${OAI_CLIENT_ID}&code=${code}&code_verifier=${verifier}&redirect_uri=${OAI_REDIRECT_URI}"
+}
+
+save_openai_codex_token() {
+    local access="$1" refresh="$2" expires="$3"
+    save_auth_profile "openai-codex:default" \
+        "$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" \
+        '{ type: "oauth", provider: "openai-codex", access: $a, refresh: $r, expires: $e }')" \
+        || { echo "openai_codex: failed to save profile" >&2; return 1; }
+    echo "openai_codex: saved OAuth token" >&2
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Provider: Google Gemini CLI (redirect OAuth with PKCE)
+# Source: extensions/google-gemini-cli-auth/oauth.ts
+# ──────────────────────────────────────────────────────────────────────────────
+
+GEMINI_AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth"
+GEMINI_TOKEN_URL="https://oauth2.googleapis.com/token"
+GEMINI_REDIRECT_URI="http://localhost:8085/oauth2callback"
+GEMINI_SCOPES="https://www.googleapis.com/auth/cloud-platform+https://www.googleapis.com/auth/userinfo.email+https://www.googleapis.com/auth/userinfo.profile"
+
+extract_gemini_cli_credentials() {
+    if [ -n "${OPENCLAW_GEMINI_OAUTH_CLIENT_ID:-}" ]; then
+        echo "${OPENCLAW_GEMINI_OAUTH_CLIENT_ID} ${OPENCLAW_GEMINI_OAUTH_CLIENT_SECRET:-}"
+        return 0
+    fi
+    if [ -n "${GEMINI_CLI_OAUTH_CLIENT_ID:-}" ]; then
+        echo "${GEMINI_CLI_OAUTH_CLIENT_ID} ${GEMINI_CLI_OAUTH_CLIENT_SECRET:-}"
+        return 0
+    fi
+    local gemini_path
+    gemini_path="$(command -v gemini 2>/dev/null)" || return 1
+    gemini_path="$(readlink -f "$gemini_path" 2>/dev/null || realpath "$gemini_path" 2>/dev/null)" || return 1
+    local gemini_dir
+    gemini_dir="$(dirname "$(dirname "$gemini_path")")"
+    local search_paths=(
+        "$gemini_dir/node_modules/@google/gemini-cli-core/dist/src/code_assist/oauth2.js"
+        "$gemini_dir/node_modules/@google/gemini-cli-core/dist/code_assist/oauth2.js"
+    )
+    local content=""
+    for p in "${search_paths[@]}"; do
+        [ -f "$p" ] && { content="$(cat "$p" 2>/dev/null)"; break; }
+    done
+    [ -z "$content" ] && return 1
+    local cid csecret
+    cid="$(echo "$content" | grep -oE '[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com' | head -1)"
+    csecret="$(echo "$content" | grep -oE 'GOCSPX-[A-Za-z0-9_-]+' | head -1)"
+    [ -z "$cid" ] && return 1
+    echo "$cid $csecret"
+}
+
+gemini_build_auth_url() {
+    local client_id="$1" challenge="$2" state="$3"
+    echo "${GEMINI_AUTH_URL}?client_id=${client_id}&response_type=code&redirect_uri=$(printf '%s' "$GEMINI_REDIRECT_URI" | jq -sRr @uri)&scope=${GEMINI_SCOPES}&code_challenge=${challenge}&code_challenge_method=S256&state=${state}&access_type=offline&prompt=consent"
+}
+
+gemini_exchange_code() {
+    local client_id="$1" client_secret="$2" code="$3" verifier="$4"
+    local body="client_id=${client_id}&code=${code}&grant_type=authorization_code&redirect_uri=${GEMINI_REDIRECT_URI}&code_verifier=${verifier}"
+    [ -n "$client_secret" ] && body="${body}&client_secret=${client_secret}"
+    curl -s -w "\n%{http_code}" -X POST "$GEMINI_TOKEN_URL" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "$body"
+}
+
+gemini_discover_project() {
+    local access_token="$1"
+    local env_project="${GOOGLE_CLOUD_PROJECT:-${GOOGLE_CLOUD_PROJECT_ID:-}}"
+    [ -n "$env_project" ] && { echo "$env_project"; return 0; }
+    local load_body
+    load_body="$(jq -n '{ metadata: { ideType: "IDE_UNSPECIFIED", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" } }')"
+    local resp
+    resp="$(curl -s -w "\n%{http_code}" -X POST "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" \
+        -H "Authorization: Bearer $access_token" \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: google-api-nodejs-client/9.15.1" \
+        -d "$load_body")" || true
+    local code="$(echo "$resp" | tail -1)"
+    local body="$(echo "$resp" | sed '$d')"
+    if [ "$code" = "200" ]; then
+        local project
+        project="$(echo "$body" | jq -r '.cloudaicompanionProject // .cloudaicompanionProject.id // empty' 2>/dev/null)"
+        [ -n "$project" ] && { echo "$project"; return 0; }
+    fi
+    echo ""
+}
+
+save_gemini_cli_token() {
+    local access="$1" refresh="$2" expires="$3" project_id="$4"
+    local profile
+    profile="$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" --arg p "$project_id" \
+        '{ type: "oauth", provider: "google-gemini-cli", access: $a, refresh: $r, expires: $e } + (if $p != "" then { projectId: $p } else {} end)')"
+    save_auth_profile "google-gemini-cli:default" "$profile" \
+        || { echo "google_gemini_cli: failed to save profile" >&2; return 1; }
+    echo "google_gemini_cli: saved OAuth token (project: ${project_id:-none})" >&2
+
+    local cfg
+    cfg="$(jq -n '{
+        models: { providers: { "google-gemini-cli": {
+            apiKey: "gemini-cli-oauth", api: "gemini",
+            models: [
+                { id: "gemini-3-pro-preview", name: "Gemini 3 Pro", reasoning: true, input: ["text","image"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 65536 },
+                { id: "gemini-3-flash-preview", name: "Gemini 3 Flash", reasoning: false, input: ["text","image"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1000000, maxTokens: 65536 }
+            ]
+        }}}
+    }' 2>/dev/null)" || true
+    [ -n "$cfg" ] && apply_provider_config_patch "$cfg" && echo "google_gemini_cli: config.patch applied" >&2
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 0: Poll ALL pending device-code flows
+# ──────────────────────────────────────────────────────────────────────────────
+
+if [ -d "$DEVICE_CODE_STATE_DIR" ]; then
+    for state_file in "$DEVICE_CODE_STATE_DIR"/*.json; do
+        [ -f "$state_file" ] || continue
+        STATE_KEY="$(basename "$state_file" .json)"
+        STATE="$(jq -c '.' "$state_file" 2>/dev/null)" || { rm -f "$state_file"; continue; }
+        STATE_TYPE="$(echo "$STATE" | jq -r '.type // "device_code"' 2>/dev/null)"
+
+        # Redirect-flow states: only clean up expired ones; token exchange is in Phase 3
+        if [ "$STATE_TYPE" = "redirect" ]; then
+            R_EXP="$(echo "$STATE" | jq -r '.expires_at // 0')"
+            if [ "$(date +%s)" -ge "$R_EXP" ]; then
+                echo "redirect_cleanup.$STATE_KEY: expired, removing stale state" >&2
+                rm -f "$state_file"
+            fi
+            continue
+        fi
+
+        DC="$(echo "$STATE" | jq -r '.device_code // empty')"
+        UC="$(echo "$STATE" | jq -r '.user_code // empty')"
+        VER="$(echo "$STATE" | jq -r '.verifier // empty')"
+        EXP="$(echo "$STATE" | jq -r '.expires_at // 0')"
+        NOW="$(date +%s)"
+
+        if [ "$NOW" -ge "$EXP" ]; then
+            echo "device_poll.$STATE_KEY: expired" >&2; rm -f "$state_file"; continue
+        fi
+
+        echo "device_poll.$STATE_KEY: polling ($(( EXP - NOW ))s left)" >&2
+
+        POLL_RESP=""
+        case "$STATE_KEY" in
+            qwen_portal)
+                [ -z "$DC" ] || [ -z "$VER" ] && { rm -f "$state_file"; continue; }
+                POLL_RESP="$(qwen_poll_token "$DC" "$VER")" || true ;;
+            github_copilot)
+                [ -z "$DC" ] && { rm -f "$state_file"; continue; }
+                POLL_RESP="$(gh_poll_token "$DC")" || true ;;
+            minimax_portal)
+                [ -z "$UC" ] || [ -z "$VER" ] && { rm -f "$state_file"; continue; }
+                POLL_RESP="$(mm_poll_token "$UC" "$VER")" || true ;;
+            *) echo "device_poll.$STATE_KEY: unknown provider" >&2; rm -f "$state_file"; continue ;;
+        esac
+        [ -z "$POLL_RESP" ] && continue
+        POLL_CODE="$(echo "$POLL_RESP" | tail -1)"
+        POLL_BODY="$(echo "$POLL_RESP" | sed '$d')"
+
+        case "$STATE_KEY" in
+            qwen_portal)
+                if [ "$POLL_CODE" = "200" ]; then
+                    ACCESS="$(echo "$POLL_BODY" | jq -r '.access_token // empty' 2>/dev/null)"
+                    REFRESH="$(echo "$POLL_BODY" | jq -r '.refresh_token // empty' 2>/dev/null)"
+                    EXPIRES_IN="$(echo "$POLL_BODY" | jq -r '.expires_in // 0' 2>/dev/null)"
+                    RESOURCE_URL="$(echo "$POLL_BODY" | jq -r '.resource_url // empty' 2>/dev/null)"
+                    if [ -n "$ACCESS" ] && [ -n "$REFRESH" ] && [ "$EXPIRES_IN" -gt 0 ] 2>/dev/null; then
+                        echo "device_poll.qwen_portal: token received!" >&2
+                        if save_qwen_token "$ACCESS" "$REFRESH" "$(( (NOW + EXPIRES_IN) * 1000 ))" "$RESOURCE_URL"; then
+                            rm -f "$state_file"
+                            post_oauth_consumed "$STATE_KEY"
+                        fi
+                    else echo "device_poll.qwen_portal: incomplete: $POLL_BODY" >&2; rm -f "$state_file"; fi
+                else
+                    PE="$(echo "$POLL_BODY" | jq -r '.error // empty' 2>/dev/null)"
+                    case "$PE" in
+                        authorization_pending) echo "device_poll.qwen_portal: pending" >&2 ;;
+                        slow_down) echo "device_poll.qwen_portal: slow_down" >&2 ;;
+                        expired_token|access_denied) echo "device_poll.qwen_portal: $PE" >&2; rm -f "$state_file" ;;
+                        *) echo "device_poll.qwen_portal: ${PE:-HTTP $POLL_CODE}" >&2 ;;
+                    esac
+                fi ;;
+            github_copilot)
+                ACCESS="$(echo "$POLL_BODY" | jq -r '.access_token // empty' 2>/dev/null)"
+                GH_ERR="$(echo "$POLL_BODY" | jq -r '.error // empty' 2>/dev/null)"
+                if [ -n "$ACCESS" ] && [ -z "$GH_ERR" ]; then
+                    echo "device_poll.github_copilot: token received!" >&2
+                    if save_github_copilot_token "$ACCESS"; then
+                        rm -f "$state_file"; post_oauth_consumed "$STATE_KEY"
+                    fi
+                else
+                    case "$GH_ERR" in
+                        authorization_pending) echo "device_poll.github_copilot: pending" >&2 ;;
+                        slow_down) echo "device_poll.github_copilot: slow_down" >&2 ;;
+                        expired_token|access_denied) echo "device_poll.github_copilot: $GH_ERR" >&2; rm -f "$state_file" ;;
+                        *) echo "device_poll.github_copilot: ${GH_ERR:-HTTP $POLL_CODE}" >&2 ;;
+                    esac
+                fi ;;
+            minimax_portal)
+                MM_ST="$(echo "$POLL_BODY" | jq -r '.status // empty' 2>/dev/null)"
+                if [ "$MM_ST" = "success" ]; then
+                    ACCESS="$(echo "$POLL_BODY" | jq -r '.access_token // empty' 2>/dev/null)"
+                    REFRESH="$(echo "$POLL_BODY" | jq -r '.refresh_token // empty' 2>/dev/null)"
+                    MM_EXP="$(echo "$POLL_BODY" | jq -r '.expired_in // 0' 2>/dev/null)"
+                    RURL="$(echo "$POLL_BODY" | jq -r '.resource_url // empty' 2>/dev/null)"
+                    if [ -n "$ACCESS" ] && [ -n "$REFRESH" ] && [ "$MM_EXP" -gt 0 ] 2>/dev/null; then
+                        echo "device_poll.minimax_portal: token received!" >&2
+                        if save_minimax_token "$ACCESS" "$REFRESH" "$MM_EXP" "$RURL"; then
+                            rm -f "$state_file"; post_oauth_consumed "$STATE_KEY"
+                        fi
+                    else echo "device_poll.minimax_portal: incomplete" >&2; rm -f "$state_file"; fi
+                elif [ "$MM_ST" = "error" ]; then
+                    echo "device_poll.minimax_portal: error" >&2; rm -f "$state_file"
+                else echo "device_poll.minimax_portal: pending" >&2; fi ;;
+        esac
+    done
+fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 0) Fetch config from xNode
@@ -110,29 +510,11 @@ run_with_timeout() {
 RESP="$(curl -s -S -w "\n%{http_code}" -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" "$OPENCLAW_API_BASE/openclaw/config")"
 HTTP_CODE="$(echo "$RESP" | tail -1)"
 RESP_BODY="$(echo "$RESP" | sed '$d')"
-
-if [ "$HTTP_CODE" != "200" ]; then
-    echo "Failed to fetch config: HTTP $HTTP_CODE" >&2
-    exit 1
-fi
-
-if [ -z "$RESP_BODY" ] || ! echo "$RESP_BODY" | head -c1 | grep -q '{'; then
-    echo "Failed to fetch config: invalid or empty response" >&2
-    exit 1
-fi
-
-if ! echo "$RESP_BODY" | jq -e . >/dev/null 2>&1; then
-    echo "Failed to fetch config: response is not valid JSON" >&2
-    exit 1
-fi
-
+if [ "$HTTP_CODE" != "200" ]; then echo "Failed to fetch config: HTTP $HTTP_CODE" >&2; exit 1; fi
+if ! echo "$RESP_BODY" | jq -e . >/dev/null 2>&1; then echo "Config response is not valid JSON" >&2; exit 1; fi
 RESP="$RESP_BODY"
 
-# Ensure gateway allows local CLI connections without manual pairing.
-# File-level change; takes effect on next gateway restart.
-if command -v openclaw &>/dev/null; then
-    openclaw config set gateway.controlUi.allowInsecureAuth true 2>/dev/null || true
-fi
+command -v openclaw &>/dev/null && openclaw config set gateway.controlUi.allowInsecureAuth true 2>/dev/null || true
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) Apply agents_defaults and tools_web_search via config.patch
@@ -141,14 +523,9 @@ fi
 AGENTS_DEFAULTS="$(echo "$RESP" | jq -c '.agents_defaults // empty' 2>/dev/null)" || AGENTS_DEFAULTS=""
 TOOLS_WEB_SEARCH="$(echo "$RESP" | jq -c '.tools_web_search // empty' 2>/dev/null)" || TOOLS_WEB_SEARCH=""
 NEED_PATCH="false"
-
 if [ -n "$AGENTS_DEFAULTS" ] && [ "$AGENTS_DEFAULTS" != "null" ] && \
-   [ "$(echo "$AGENTS_DEFAULTS" | jq -r 'keys | length' 2>/dev/null)" -gt 0 ] 2>/dev/null; then
-    NEED_PATCH="true"
-fi
-if [ -n "$TOOLS_WEB_SEARCH" ] && [ "$TOOLS_WEB_SEARCH" != "null" ]; then
-    NEED_PATCH="true"
-fi
+   [ "$(echo "$AGENTS_DEFAULTS" | jq -r 'keys | length' 2>/dev/null)" -gt 0 ] 2>/dev/null; then NEED_PATCH="true"; fi
+if [ -n "$TOOLS_WEB_SEARCH" ] && [ "$TOOLS_WEB_SEARCH" != "null" ]; then NEED_PATCH="true"; fi
 
 if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
     HASH="$(openclaw gateway call config.get --params '{}' 2>/dev/null | jq -r '.payload.hash // .hash // empty' 2>/dev/null)" || HASH=""
@@ -163,9 +540,7 @@ if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
             2>/dev/null | jq -c . 2>/dev/null)" || RAW_JSON=""
         if [ -n "$RAW_JSON" ] && [ "$RAW_JSON" != "{}" ]; then
             PARAMS="$(jq -n --arg h "$HASH" --arg r "$RAW_JSON" '{ baseHash: $h, raw: $r }' 2>/dev/null)" || true
-            if [ -n "$PARAMS" ] && ! openclaw gateway call config.patch --params "$PARAMS" 2>/dev/null; then
-                echo "Warning: config.patch failed (gateway may be down or unreachable)" >&2
-            fi
+            [ -n "$PARAMS" ] && openclaw gateway call config.patch --params "$PARAMS" 2>/dev/null || echo "Warning: config.patch failed" >&2
         fi
     fi
 fi
@@ -177,203 +552,325 @@ fi
 OAUTH_URL_REQUESTS_RAW="$(echo "$RESP" | jq -r '.oauth_url_requests // {} | to_entries[] | select(.value == true) | .key' 2>/dev/null)" || true
 [ -z "$OAUTH_URL_REQUESTS_RAW" ] && OAUTH_URL_REQUESTS_RAW=""
 
-# -- Phase A: enable plugins that aren't yet enabled --
+# -- Phase A: enable plugins --
 NEED_GATEWAY_RESTART=0
-RESTART_FLAG="/tmp/openclaw-sync-gateway-restarted"
-
 while IFS= read -r KEY || [ -n "$KEY" ]; do
     KEY="$(echo "${KEY:-}" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$KEY" ] && continue
     command -v openclaw &>/dev/null || continue
-
     PLUGIN="$(plugin_for_key "$KEY")"
     [ -z "$PLUGIN" ] && continue
-
-    # Check if plugin is already known to the CLI (enabled in config).
-    # `plugins list` reads from config + discovery, so it works even if
-    # the gateway hasn't loaded the plugin yet.
-    if openclaw plugins list 2>/dev/null | grep -qi "$PLUGIN"; then
-        continue
+    openclaw plugins list 2>/dev/null | grep -qi "$PLUGIN" && continue
+    if ENABLE_OUT="$(openclaw plugins enable "$PLUGIN" 2>&1)"; then
+        echo "plugins enable $PLUGIN: $ENABLE_OUT" >&2; NEED_GATEWAY_RESTART=1
+    else
+        echo "plugins enable $PLUGIN: failed - $ENABLE_OUT" >&2
     fi
-
-    ENABLE_OUT="$(openclaw plugins enable "$PLUGIN" 2>&1)" || true
-    echo "plugins enable $PLUGIN: $ENABLE_OUT" >&2
-    NEED_GATEWAY_RESTART=1
 done <<< "$OAUTH_URL_REQUESTS_RAW"
 
-# -- Gateway restart with loop prevention --
-# Only restart if we just enabled a NEW plugin. A flag file with 120s cooldown
-# prevents the script from re-restarting on every run. After restart we exit 0
-# to let the gateway fully start before Phase B runs on the next timer tick.
 if [ "$NEED_GATEWAY_RESTART" = "1" ]; then
     SKIP_RESTART=0
     if [ -f "$RESTART_FLAG" ]; then
         FLAG_MTIME="$(stat -c %Y "$RESTART_FLAG" 2>/dev/null || stat -f %m "$RESTART_FLAG" 2>/dev/null || echo 0)"
-        NOW="$(date +%s)"
-        FLAG_AGE=$(( NOW - FLAG_MTIME ))
-        if [ "$FLAG_AGE" -lt 120 ]; then
-            SKIP_RESTART=1
-        fi
+        [ "$(( $(date +%s) - FLAG_MTIME ))" -lt 120 ] && SKIP_RESTART=1
     fi
-
     if [ "$SKIP_RESTART" = "0" ]; then
-        echo "Restarting OpenClaw gateway to load new plugin(s)..." >&2
+        echo "Restarting gateway for new plugin(s)..." >&2
         openclaw gateway stop 2>&1 || true
         GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            if ! (lsof -nP -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN 2>/dev/null | grep -q .); then
-                break
-            fi
-            [ "$i" -eq 1 ] && echo "Waiting for gateway port $GATEWAY_PORT to be free..." >&2
+        for i in $(seq 1 10); do
+            (lsof -nP -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN 2>/dev/null | grep -q .) || break
             sleep 1
         done
-        # Non-zero exit from `gateway start` may just mean the health check
-        # timed out (OpenClaw #22972); the daemon is still starting.
         openclaw gateway start 2>&1 || true
         touch "$RESTART_FLAG"
-        echo "Gateway restart initiated. Auth URL will be fetched on next run (~10s)." >&2
+        echo "Gateway restarted. URLs will be fetched next run." >&2
         exit 0
     fi
 fi
 
-# -- Pre-flight: check that the gateway is reachable before Phase B --
-if [ -n "$OAUTH_URL_REQUESTS_RAW" ]; then
-    if ! openclaw gateway health --timeout 10000 2>/dev/null; then
-        echo "Gateway is not healthy; skipping auth URL fetch. Will retry next run." >&2
-        exit 0
+# -- Pre-flight: gateway health for CLI-based providers --
+GATEWAY_HEALTHY=""
+needs_gateway_for_cli() {
+    while IFS= read -r K || [ -n "$K" ]; do
+        K="$(echo "${K:-}" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -z "$K" ] && continue
+        is_self_handled_provider "$K" || return 0
+    done <<< "$OAUTH_URL_REQUESTS_RAW"
+    return 1
+}
+if [ -n "$OAUTH_URL_REQUESTS_RAW" ] && needs_gateway_for_cli; then
+    if command -v openclaw &>/dev/null && ! openclaw gateway health --timeout 10000 2>/dev/null; then
+        GATEWAY_HEALTHY="no"
+        echo "Gateway unhealthy; CLI-based auth URLs will be skipped." >&2
     fi
 fi
 
-# -- Phase B: run auth login and capture the device-code URL --
-# OpenClaw's auth login opens the URL in a browser (via xdg-open / the `open` npm
-# package). On a headless server there's no browser, so the URL is lost.
-# We intercept it two ways:
-#   1) BROWSER env var — xdg-open and some Node helpers check this first.
-#   2) Fake xdg-open early in PATH — catches direct xdg-open calls.
-# Both write the URL to a temp file so we can read it after the command exits.
-FAKE_BIN_DIR="/tmp/openclaw-sync-fakebin-$$"
-mkdir -p "$FAKE_BIN_DIR"
+# -- Phase B: get auth URL per provider --
 
-cat > "$FAKE_BIN_DIR/url-capture" << 'CAPTURE_EOF'
-#!/bin/sh
-echo "$1" >> "$OPENCLAW_URL_CAPTURE_FILE"
-CAPTURE_EOF
-chmod +x "$FAKE_BIN_DIR/url-capture"
-
-cat > "$FAKE_BIN_DIR/xdg-open" << 'XDG_EOF'
-#!/bin/sh
-echo "$1" >> "$OPENCLAW_URL_CAPTURE_FILE"
-XDG_EOF
-chmod +x "$FAKE_BIN_DIR/xdg-open"
-
-ORIG_PATH="$PATH"
+get_auth_url_via_cli() {
+    local provider="$1" raw_out url
+    if [ "$HAS_SCRIPT_PTY" = "1" ]; then
+        local cmd; cmd="$(printf '%q ' openclaw models auth login --provider "$provider")"
+        raw_out="$(timeout 45 script -q -e -c "$cmd" /dev/null 2>&1)" || true
+    else
+        raw_out="$(run_with_timeout 45 openclaw models auth login --provider "$provider")" || true
+    fi
+    url="$(printf '%s' "$raw_out" | LC_ALL=C tr -d '\000-\010\016-\037' | grep -oE 'https://[^ "'\''<>{}|\\^`\[\]]+' | head -1)"
+    [ -z "$url" ] && echo "CLI produced no URL. Output: $(printf '%s' "$raw_out" | strip_ansi | head -c 500)" >&2
+    echo "$url"
+}
 
 while IFS= read -r KEY || [ -n "$KEY" ]; do
     KEY="$(echo "${KEY:-}" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$KEY" ] && continue
-    command -v openclaw &>/dev/null || { echo "oauth_url_requests.$KEY: openclaw not in PATH" >&2; continue; }
 
-    PROVIDER="$(provider_for_key "$KEY")"
-    URL_CAPTURE_FILE="/tmp/openclaw-sync-url-$$-$KEY"
-    rm -f "$URL_CAPTURE_FILE"
+    # Skip if state file already exists (pending poll or pending redirect)
+    [ -f "$DEVICE_CODE_STATE_DIR/$KEY.json" ] && {
+        echo "oauth_url_requests.$KEY: already pending, skipping" >&2; continue; }
 
-    export BROWSER="$FAKE_BIN_DIR/url-capture"
-    export OPENCLAW_URL_CAPTURE_FILE="$URL_CAPTURE_FILE"
-    export PATH="$FAKE_BIN_DIR:$ORIG_PATH"
-
-    OUT="$(run_with_pty 45 openclaw models auth login --provider "$PROVIDER")" || true
-
-    export PATH="$ORIG_PATH"
-    unset BROWSER OPENCLAW_URL_CAPTURE_FILE
-
-    # Primary: read URL from the capture file (written by our fake browser)
     AUTH_URL=""
-    if [ -f "$URL_CAPTURE_FILE" ]; then
-        AUTH_URL="$(head -1 "$URL_CAPTURE_FILE" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-        echo "oauth_url_requests.$KEY: captured URL via BROWSER intercept: $AUTH_URL" >&2
-    fi
 
-    # Fallback: try to extract from stdout (some providers print the URL directly)
-    if [ -z "$AUTH_URL" ] && [ -n "$OUT" ]; then
-        AUTH_URL="$(echo "$OUT" | grep -oE 'https://[^ )[\]"'\''<>]+' | head -1)"
-        [ -z "$AUTH_URL" ] && AUTH_URL="$(echo "$OUT" | grep -oE 'https?://[^ )[\]"'\''<>]+' | head -1)"
-        [ -n "$AUTH_URL" ] && echo "oauth_url_requests.$KEY: extracted URL from stdout: $AUTH_URL" >&2
-    fi
+    case "$KEY" in
 
-    rm -f "$URL_CAPTURE_FILE"
+        # ── Qwen: device-code ──
+        qwen_portal)
+            PKCE="$(generate_pkce)"; VERIFIER="${PKCE%% *}"; CHALLENGE="${PKCE##* }"
+            DC_RESP="$(qwen_request_device_code "$CHALLENGE")" || true
+            DC_CODE="$(echo "$DC_RESP" | tail -1)"; DC_BODY="$(echo "$DC_RESP" | sed '$d')"
+            if [ "$DC_CODE" = "200" ]; then
+                DEVICE_CODE="$(echo "$DC_BODY" | jq -r '.device_code // empty' 2>/dev/null)"
+                USER_CODE="$(echo "$DC_BODY" | jq -r '.user_code // empty' 2>/dev/null)"
+                VURI="$(echo "$DC_BODY" | jq -r '.verification_uri_complete // .verification_uri // empty' 2>/dev/null)"
+                EXP_IN="$(echo "$DC_BODY" | jq -r '.expires_in // 600' 2>/dev/null)"
+                INTV="$(echo "$DC_BODY" | jq -r '.interval // 2' 2>/dev/null)"
+                AUTH_URL="$VURI"
+                [ -n "$DEVICE_CODE" ] && [ -n "$AUTH_URL" ] && \
+                    save_state "$KEY" --arg dc "$DEVICE_CODE" --arg uc "$USER_CODE" --arg v "$VERIFIER" \
+                        --argjson ea "$(( $(date +%s) + EXP_IN ))" --argjson iv "$INTV" \
+                        '{ device_code: $dc, user_code: $uc, verifier: $v, expires_at: $ea, interval: $iv }' && \
+                    echo "oauth_url_requests.qwen_portal: URL ready (code: ${USER_CODE:-n/a})" >&2
+            else echo "oauth_url_requests.qwen_portal: HTTP $DC_CODE" >&2; fi ;;
 
-    if echo "$OUT" | grep -qi "no provider plugins found\|provider not found\|unknown provider"; then
-        echo "oauth_url_requests.$KEY: plugin not loaded. Restart the gateway: openclaw gateway restart" >&2
-        continue
-    fi
+        # ── GitHub Copilot: device-code ──
+        github_copilot)
+            DC_RESP="$(gh_request_device_code)" || true
+            DC_CODE="$(echo "$DC_RESP" | tail -1)"; DC_BODY="$(echo "$DC_RESP" | sed '$d')"
+            if [ "$DC_CODE" = "200" ]; then
+                DEVICE_CODE="$(echo "$DC_BODY" | jq -r '.device_code // empty' 2>/dev/null)"
+                USER_CODE="$(echo "$DC_BODY" | jq -r '.user_code // empty' 2>/dev/null)"
+                VURI="$(echo "$DC_BODY" | jq -r '.verification_uri // empty' 2>/dev/null)"
+                EXP_IN="$(echo "$DC_BODY" | jq -r '.expires_in // 900' 2>/dev/null)"
+                INTV="$(echo "$DC_BODY" | jq -r '.interval // 5' 2>/dev/null)"
+                AUTH_URL="$VURI"
+                [ -n "$DEVICE_CODE" ] && [ -n "$AUTH_URL" ] && \
+                    save_state "$KEY" --arg dc "$DEVICE_CODE" --arg uc "$USER_CODE" --arg v "" \
+                        --argjson ea "$(( $(date +%s) + EXP_IN ))" --argjson iv "$INTV" \
+                        '{ device_code: $dc, user_code: $uc, verifier: $v, expires_at: $ea, interval: $iv }' && \
+                    echo "oauth_url_requests.github_copilot: URL ready (code: ${USER_CODE:-n/a})" >&2
+                [ -n "$USER_CODE" ] && AUTH_URL="${AUTH_URL}?user_code=${USER_CODE}"
+            else echo "oauth_url_requests.github_copilot: HTTP $DC_CODE" >&2; fi ;;
 
-    if [ -z "$AUTH_URL" ]; then
-        echo "oauth_url_requests.$KEY: no URL captured. Try running manually: openclaw models auth login --provider $PROVIDER" >&2
-        continue
-    fi
+        # ── MiniMax: device-code with PKCE + state ──
+        minimax_portal)
+            PKCE="$(generate_pkce)"; VERIFIER="${PKCE%% *}"; CHALLENGE="${PKCE##* }"
+            MM_STATE="$(openssl rand -base64 16 | tr '+/' '-_' | tr -d '=')"
+            DC_RESP="$(mm_request_device_code "$CHALLENGE" "$MM_STATE")" || true
+            DC_CODE="$(echo "$DC_RESP" | tail -1)"; DC_BODY="$(echo "$DC_RESP" | sed '$d')"
+            if [ "$DC_CODE" = "200" ]; then
+                USER_CODE="$(echo "$DC_BODY" | jq -r '.user_code // empty' 2>/dev/null)"
+                VURI="$(echo "$DC_BODY" | jq -r '.verification_uri // empty' 2>/dev/null)"
+                MM_EXP_IN="$(echo "$DC_BODY" | jq -r '.expired_in // 0' 2>/dev/null)"
+                INTV="$(echo "$DC_BODY" | jq -r '.interval // 2000' 2>/dev/null)"
+                RESP_STATE="$(echo "$DC_BODY" | jq -r '.state // empty' 2>/dev/null)"
+                if [ "$RESP_STATE" != "$MM_STATE" ]; then
+                    echo "oauth_url_requests.minimax_portal: state mismatch" >&2
+                elif [ -n "$USER_CODE" ] && [ -n "$VURI" ]; then
+                    AUTH_URL="$VURI"
+                    NOW_MS="$(( $(date +%s) * 1000 ))"
+                    if [ "$MM_EXP_IN" -gt "$NOW_MS" ] 2>/dev/null; then EXP_S="$(( MM_EXP_IN / 1000 ))"
+                    else EXP_S="$(( $(date +%s) + 600 ))"; fi
+                    INTV_S="$(( INTV / 1000 ))"; [ "$INTV_S" -lt 2 ] && INTV_S=2
+                    save_state "$KEY" --arg dc "" --arg uc "$USER_CODE" --arg v "$VERIFIER" \
+                        --argjson ea "$EXP_S" --argjson iv "$INTV_S" \
+                        '{ device_code: $dc, user_code: $uc, verifier: $v, expires_at: $ea, interval: $iv }'
+                    echo "oauth_url_requests.minimax_portal: URL ready (code: $USER_CODE)" >&2
+                fi
+            else echo "oauth_url_requests.minimax_portal: HTTP $DC_CODE" >&2; fi ;;
 
-    # POST auth URL to xNode
-    POST_BODY="$(jq -n --arg k "$KEY" --arg u "$AUTH_URL" '{ key: $k, auth_url: $u }' 2>/dev/null)" || true
-    if [ -z "$POST_BODY" ]; then
-        echo "oauth_url_requests.$KEY: failed to build request body" >&2
-        continue
-    fi
+        # ── OpenAI Codex: redirect OAuth with PKCE ──
+        openai_codex)
+            PKCE="$(generate_pkce)"; VERIFIER="${PKCE%% *}"; CHALLENGE="${PKCE##* }"
+            OAI_STATE="$(openssl rand -hex 16)"
+            AUTH_URL="$(oai_build_auth_url "$CHALLENGE" "$OAI_STATE")"
+            save_state "$KEY" --arg v "$VERIFIER" --arg s "$OAI_STATE" --argjson ea "$(( $(date +%s) + 600 ))" \
+                '{ type: "redirect", verifier: $v, state: $s, expires_at: $ea }'
+            echo "oauth_url_requests.openai_codex: redirect URL ready" >&2
+            ;;
 
+        # ── Google Gemini CLI: redirect OAuth with PKCE ──
+        google_gemini_cli)
+            GCREDS="$(extract_gemini_cli_credentials 2>/dev/null)" || GCREDS=""
+            if [ -z "$GCREDS" ]; then
+                echo "oauth_url_requests.google_gemini_cli: no client_id (install gemini-cli or set GEMINI_CLI_OAUTH_CLIENT_ID)" >&2
+                continue
+            fi
+            G_CID="${GCREDS%% *}"; G_CSECRET="${GCREDS#* }"
+            [ "$G_CSECRET" = "$G_CID" ] && G_CSECRET=""
+            PKCE="$(generate_pkce)"; VERIFIER="${PKCE%% *}"; CHALLENGE="${PKCE##* }"
+            G_STATE="$(openssl rand -hex 16)"
+            AUTH_URL="$(gemini_build_auth_url "$G_CID" "$CHALLENGE" "$G_STATE")"
+            save_state "$KEY" --arg v "$VERIFIER" --arg s "$G_STATE" --arg cid "$G_CID" --arg cs "$G_CSECRET" \
+                --argjson ea "$(( $(date +%s) + 600 ))" \
+                '{ type: "redirect", verifier: $v, state: $s, client_id: $cid, client_secret: $cs, expires_at: $ea }'
+            echo "oauth_url_requests.google_gemini_cli: redirect URL ready" >&2
+            ;;
+
+        # ── All other providers: CLI fallback ──
+        *)
+            command -v openclaw &>/dev/null || { echo "oauth_url_requests.$KEY: openclaw not in PATH" >&2; continue; }
+            [ "$GATEWAY_HEALTHY" = "no" ] && { echo "oauth_url_requests.$KEY: skipped (gateway unhealthy)" >&2; continue; }
+            PROVIDER="$(provider_for_key "$KEY")"
+            AUTH_URL="$(get_auth_url_via_cli "$PROVIDER")"
+            [ -n "$AUTH_URL" ] && echo "oauth_url_requests.$KEY: URL from CLI" >&2
+            ;;
+    esac
+
+    if [ -z "$AUTH_URL" ]; then echo "oauth_url_requests.$KEY: no URL obtained" >&2; continue; fi
+
+    POST_BODY="$(jq -n --arg k "$KEY" --arg u "$AUTH_URL" '{ key: $k, auth_url: $u }')" || continue
     POST_RESP="$(curl -s -w "\n%{http_code}" -X POST \
         -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" \
         -H "Content-Type: application/json" \
-        -d "$POST_BODY" \
-        "$OPENCLAW_API_BASE/openclaw/oauth-auth-url")" || true
+        -d "$POST_BODY" "$OPENCLAW_API_BASE/openclaw/oauth-auth-url")" || true
     POST_CODE="$(echo "$POST_RESP" | tail -1)"
-
     if [ "$POST_CODE" = "200" ] && echo "$POST_RESP" | sed '$d' | jq -e '.ok' >/dev/null 2>&1; then
-        echo "oauth_url_requests.$KEY: auth URL sent to xNode" >&2
-        rm -f "$RESTART_FLAG"
-    else
-        echo "oauth_url_requests.$KEY: POST failed (HTTP $POST_CODE). Check OPENCLAW_API_BASE=$OPENCLAW_API_BASE" >&2
-    fi
+        echo "oauth_url_requests.$KEY: sent to xNode" >&2; rm -f "$RESTART_FLAG"
+    else echo "oauth_url_requests.$KEY: POST failed (HTTP $POST_CODE)" >&2; fi
 done <<< "$OAUTH_URL_REQUESTS_RAW"
-
-rm -rf "$FAKE_BIN_DIR"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3) oauth_pending: apply tokens/URLs, then mark consumed
 # ──────────────────────────────────────────────────────────────────────────────
 
-apply_oauth_pending() {
-    local key="$1"
-    local val="$2"
-    [ -z "$val" ] && return 1
-    [ "$val" = "null" ] && return 1
-    if [ "$key" = "anthropic_setup_token" ]; then
-        echo "$val" | openclaw models auth paste-token --provider anthropic 2>/dev/null
-    else
-        local provider
-        provider="$(echo "$key" | sed 's/_/-/g')"
-        (echo "$val"; sleep 1) | run_with_timeout 45 openclaw models auth login --provider "$provider" 2>/dev/null
-    fi
-}
-
 OAUTH_PENDING_KEYS="$(echo "$RESP" | jq -r '.oauth_pending // {} | keys[]' 2>/dev/null)" || true
-if [ -z "$OAUTH_PENDING_KEYS" ]; then
-    exit 0
-fi
+[ -z "$OAUTH_PENDING_KEYS" ] && exit 0
 
 CONSUMED=()
 while IFS= read -r KEY || [ -n "$KEY" ]; do
     KEY="$(echo "${KEY:-}" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$KEY" ] && continue
+
     VAL="$(echo "$RESP" | jq -r --arg k "$KEY" '.oauth_pending[$k] // empty' 2>/dev/null)" || VAL=""
-    [ -z "$VAL" ] && continue
-    [ "$VAL" = "null" ] && continue
-    if apply_oauth_pending "$KEY" "$VAL"; then
-        CONSUMED+=("$KEY")
-    fi
+
+    case "$KEY" in
+
+        # Device-code providers: token is via Phase 0 polling, not the pasted value
+        qwen_portal|github_copilot|minimax_portal)
+            echo "oauth_pending.$KEY: consumed (device-code handled by polling)" >&2
+            CONSUMED+=("$KEY")
+            ;;
+
+        # ── OpenAI Codex: exchange authorization code using saved PKCE verifier ──
+        openai_codex)
+            [ -z "$VAL" ] || [ "$VAL" = "null" ] && continue
+            SF="$DEVICE_CODE_STATE_DIR/$KEY.json"
+            if [ ! -f "$SF" ]; then
+                echo "oauth_pending.openai_codex: no saved state (verifier missing); re-request auth link" >&2; continue
+            fi
+            S="$(jq -c '.' "$SF" 2>/dev/null)" || continue
+            VERIFIER="$(echo "$S" | jq -r '.verifier // empty')"
+            SAVED_STATE="$(echo "$S" | jq -r '.state // empty')"
+            [ -z "$VERIFIER" ] && { echo "oauth_pending.openai_codex: no verifier" >&2; rm -f "$SF"; continue; }
+
+            CODE="$(extract_url_param "$VAL" "code")"
+            [ -z "$CODE" ] && { echo "oauth_pending.openai_codex: no 'code' in pasted URL: $VAL" >&2; continue; }
+
+            URL_STATE="$(extract_url_param "$VAL" "state")"
+            if [ -n "$SAVED_STATE" ] && [ -n "$URL_STATE" ] && [ "$SAVED_STATE" != "$URL_STATE" ]; then
+                echo "oauth_pending.openai_codex: state mismatch" >&2; continue
+            fi
+
+            echo "oauth_pending.openai_codex: exchanging code..." >&2
+            T_RESP="$(oai_exchange_code "$CODE" "$VERIFIER")" || true
+            T_CODE="$(echo "$T_RESP" | tail -1)"; T_BODY="$(echo "$T_RESP" | sed '$d')"
+
+            if [ "$T_CODE" = "200" ]; then
+                ACCESS="$(echo "$T_BODY" | jq -r '.access_token // empty' 2>/dev/null)"
+                REFRESH="$(echo "$T_BODY" | jq -r '.refresh_token // empty' 2>/dev/null)"
+                EXP_IN="$(echo "$T_BODY" | jq -r '.expires_in // 3600' 2>/dev/null)"
+                if [ -n "$ACCESS" ]; then
+                    EXP_MS="$(( ($(date +%s) + EXP_IN) * 1000 ))"
+                    if save_openai_codex_token "$ACCESS" "$REFRESH" "$EXP_MS"; then
+                        rm -f "$SF"; CONSUMED+=("$KEY")
+                        echo "oauth_pending.openai_codex: success!" >&2
+                    fi
+                else echo "oauth_pending.openai_codex: no access_token: $T_BODY" >&2; fi
+            else echo "oauth_pending.openai_codex: exchange failed HTTP $T_CODE: $T_BODY" >&2; fi
+            ;;
+
+        # ── Google Gemini CLI: exchange code using saved PKCE verifier + client_id ──
+        google_gemini_cli)
+            [ -z "$VAL" ] || [ "$VAL" = "null" ] && continue
+            SF="$DEVICE_CODE_STATE_DIR/$KEY.json"
+            if [ ! -f "$SF" ]; then
+                echo "oauth_pending.google_gemini_cli: no saved state; re-request auth link" >&2; continue
+            fi
+            S="$(jq -c '.' "$SF" 2>/dev/null)" || continue
+            VERIFIER="$(echo "$S" | jq -r '.verifier // empty')"
+            SAVED_STATE="$(echo "$S" | jq -r '.state // empty')"
+            G_CID="$(echo "$S" | jq -r '.client_id // empty')"
+            G_CSECRET="$(echo "$S" | jq -r '.client_secret // empty')"
+            [ -z "$VERIFIER" ] || [ -z "$G_CID" ] && { echo "oauth_pending.google_gemini_cli: incomplete state" >&2; rm -f "$SF"; continue; }
+
+            CODE="$(extract_url_param "$VAL" "code")"
+            [ -z "$CODE" ] && { echo "oauth_pending.google_gemini_cli: no 'code' in pasted URL" >&2; continue; }
+
+            URL_STATE="$(extract_url_param "$VAL" "state")"
+            if [ -n "$SAVED_STATE" ] && [ -n "$URL_STATE" ] && [ "$SAVED_STATE" != "$URL_STATE" ]; then
+                echo "oauth_pending.google_gemini_cli: state mismatch" >&2; continue
+            fi
+
+            echo "oauth_pending.google_gemini_cli: exchanging code..." >&2
+            T_RESP="$(gemini_exchange_code "$G_CID" "$G_CSECRET" "$CODE" "$VERIFIER")" || true
+            T_CODE="$(echo "$T_RESP" | tail -1)"; T_BODY="$(echo "$T_RESP" | sed '$d')"
+
+            if [ "$T_CODE" = "200" ]; then
+                ACCESS="$(echo "$T_BODY" | jq -r '.access_token // empty' 2>/dev/null)"
+                REFRESH="$(echo "$T_BODY" | jq -r '.refresh_token // empty' 2>/dev/null)"
+                EXP_IN="$(echo "$T_BODY" | jq -r '.expires_in // 3600' 2>/dev/null)"
+                if [ -n "$ACCESS" ] && [ -n "$REFRESH" ]; then
+                    EXP_MS="$(( ($(date +%s) + EXP_IN) * 1000 ))"
+                    PROJECT="$(gemini_discover_project "$ACCESS")" || PROJECT=""
+                    if save_gemini_cli_token "$ACCESS" "$REFRESH" "$EXP_MS" "$PROJECT"; then
+                        rm -f "$SF"; CONSUMED+=("$KEY")
+                        echo "oauth_pending.google_gemini_cli: success!" >&2
+                    fi
+                else echo "oauth_pending.google_gemini_cli: no tokens: $T_BODY" >&2; fi
+            else echo "oauth_pending.google_gemini_cli: exchange failed HTTP $T_CODE: $T_BODY" >&2; fi
+            ;;
+
+        # ── Anthropic: paste-token ──
+        anthropic_setup_token)
+            [ -z "$VAL" ] || [ "$VAL" = "null" ] && continue
+            if echo "$VAL" | openclaw models auth paste-token --provider anthropic 2>/dev/null; then
+                CONSUMED+=("$KEY")
+            fi
+            ;;
+
+        # ── CLI fallback for everything else ──
+        *)
+            [ -z "$VAL" ] || [ "$VAL" = "null" ] && continue
+            echo "oauth_pending.$KEY: WARNING - CLI fallback may not work for redirect OAuth (PKCE mismatch)" >&2
+            PROVIDER="$(echo "$KEY" | sed 's/_/-/g')"
+            if (echo "$VAL"; sleep 1) | run_with_timeout 45 openclaw models auth login --provider "$PROVIDER" 2>/dev/null; then
+                CONSUMED+=("$KEY")
+            fi
+            ;;
+    esac
 done <<< "$OAUTH_PENDING_KEYS"
 
-if [ ${#CONSUMED[@]} -eq 0 ]; then
-    exit 0
-fi
+[ ${#CONSUMED[@]} -eq 0 ] && exit 0
 
 KEYS_JSON="$(printf '%s\n' "${CONSUMED[@]}" | jq -R . | jq -s . 2>/dev/null)" || exit 1
 CONSUMED_RESP="$(curl -s -w "\n%{http_code}" -X POST \
@@ -382,6 +879,4 @@ CONSUMED_RESP="$(curl -s -w "\n%{http_code}" -X POST \
     -d "{\"keys\": $KEYS_JSON}" \
     "$OPENCLAW_API_BASE/openclaw/oauth-consumed")" || true
 CONSUMED_CODE="$(echo "$CONSUMED_RESP" | tail -1)"
-if [ "$CONSUMED_CODE" != "200" ]; then
-    echo "Warning: POST oauth-consumed returned HTTP $CONSUMED_CODE (keys may be retried on next run)" >&2
-fi
+[ "$CONSUMED_CODE" != "200" ] && echo "Warning: POST oauth-consumed HTTP $CONSUMED_CODE" >&2

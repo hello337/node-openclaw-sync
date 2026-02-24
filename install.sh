@@ -15,6 +15,13 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+for dep in jq openssl curl; do
+    if ! command -v "$dep" &>/dev/null; then
+        echo "Missing required dependency: $dep" >&2
+        exit 1
+    fi
+done
+
 if [ ! -x "$INSTALL_DIR/openclaw-sync" ]; then
     chmod +x "$INSTALL_DIR/openclaw-sync"
 fi
