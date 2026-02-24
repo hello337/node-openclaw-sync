@@ -879,4 +879,8 @@ CONSUMED_RESP="$(curl -s -w "\n%{http_code}" -X POST \
     -d "{\"keys\": $KEYS_JSON}" \
     "$OPENCLAW_API_BASE/openclaw/oauth-consumed")" || true
 CONSUMED_CODE="$(echo "$CONSUMED_RESP" | tail -1)"
-[ "$CONSUMED_CODE" != "200" ] && echo "Warning: POST oauth-consumed HTTP $CONSUMED_CODE" >&2
+if [ "$CONSUMED_CODE" != "200" ]; then
+    echo "Warning: POST oauth-consumed HTTP $CONSUMED_CODE" >&2
+fi
+
+exit 0
