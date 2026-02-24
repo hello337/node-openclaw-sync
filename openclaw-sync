@@ -244,38 +244,71 @@ if [ -n "$OAUTH_URL_REQUESTS_RAW" ]; then
     fi
 fi
 
-# -- Phase B: run auth login with pseudo-TTY to capture the device-code URL --
-# OpenClaw's CLI suppresses interactive output (URLs, device codes) when stdout
-# is not a TTY. We use Linux `script -qec` to wrap the command in a pseudo-TTY.
-# See: github.com/openclaw/openclaw/discussions/13192
+# -- Phase B: run auth login and capture the device-code URL --
+# OpenClaw's auth login opens the URL in a browser (via xdg-open / the `open` npm
+# package). On a headless server there's no browser, so the URL is lost.
+# We intercept it two ways:
+#   1) BROWSER env var — xdg-open and some Node helpers check this first.
+#   2) Fake xdg-open early in PATH — catches direct xdg-open calls.
+# Both write the URL to a temp file so we can read it after the command exits.
+FAKE_BIN_DIR="/tmp/openclaw-sync-fakebin-$$"
+mkdir -p "$FAKE_BIN_DIR"
+
+cat > "$FAKE_BIN_DIR/url-capture" << 'CAPTURE_EOF'
+#!/bin/sh
+echo "$1" >> "$OPENCLAW_URL_CAPTURE_FILE"
+CAPTURE_EOF
+chmod +x "$FAKE_BIN_DIR/url-capture"
+
+cat > "$FAKE_BIN_DIR/xdg-open" << 'XDG_EOF'
+#!/bin/sh
+echo "$1" >> "$OPENCLAW_URL_CAPTURE_FILE"
+XDG_EOF
+chmod +x "$FAKE_BIN_DIR/xdg-open"
+
+ORIG_PATH="$PATH"
+
 while IFS= read -r KEY || [ -n "$KEY" ]; do
     KEY="$(echo "${KEY:-}" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$KEY" ] && continue
     command -v openclaw &>/dev/null || { echo "oauth_url_requests.$KEY: openclaw not in PATH" >&2; continue; }
 
     PROVIDER="$(provider_for_key "$KEY")"
+    URL_CAPTURE_FILE="/tmp/openclaw-sync-url-$$-$KEY"
+    rm -f "$URL_CAPTURE_FILE"
+
+    export BROWSER="$FAKE_BIN_DIR/url-capture"
+    export OPENCLAW_URL_CAPTURE_FILE="$URL_CAPTURE_FILE"
+    export PATH="$FAKE_BIN_DIR:$ORIG_PATH"
 
     OUT="$(run_with_pty 45 openclaw models auth login --provider "$PROVIDER")" || true
 
-    # Log full output for diagnostics (visible in journalctl)
-    if [ -n "$OUT" ]; then
-        echo "oauth_url_requests.$KEY: auth login raw output: $OUT" >&2
-    else
-        echo "oauth_url_requests.$KEY: auth login produced no output" >&2
+    export PATH="$ORIG_PATH"
+    unset BROWSER OPENCLAW_URL_CAPTURE_FILE
+
+    # Primary: read URL from the capture file (written by our fake browser)
+    AUTH_URL=""
+    if [ -f "$URL_CAPTURE_FILE" ]; then
+        AUTH_URL="$(head -1 "$URL_CAPTURE_FILE" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        echo "oauth_url_requests.$KEY: captured URL via BROWSER intercept: $AUTH_URL" >&2
     fi
+
+    # Fallback: try to extract from stdout (some providers print the URL directly)
+    if [ -z "$AUTH_URL" ] && [ -n "$OUT" ]; then
+        AUTH_URL="$(echo "$OUT" | grep -oE 'https://[^ )[\]"'\''<>]+' | head -1)"
+        [ -z "$AUTH_URL" ] && AUTH_URL="$(echo "$OUT" | grep -oE 'https?://[^ )[\]"'\''<>]+' | head -1)"
+        [ -n "$AUTH_URL" ] && echo "oauth_url_requests.$KEY: extracted URL from stdout: $AUTH_URL" >&2
+    fi
+
+    rm -f "$URL_CAPTURE_FILE"
 
     if echo "$OUT" | grep -qi "no provider plugins found\|provider not found\|unknown provider"; then
         echo "oauth_url_requests.$KEY: plugin not loaded. Restart the gateway: openclaw gateway restart" >&2
         continue
     fi
 
-    # Extract URL — try several patterns
-    AUTH_URL="$(echo "$OUT" | grep -oE 'https://[^ )[\]"'\''<>]+' | head -1)"
-    [ -z "$AUTH_URL" ] && AUTH_URL="$(echo "$OUT" | grep -oE '"verification_uri"[[:space:]]*:[[:space:]]*"[^"]+"' | sed 's/.*"\(https\?:[^"]*\)".*/\1/' | head -1)"
-    [ -z "$AUTH_URL" ] && AUTH_URL="$(echo "$OUT" | grep -oE 'https?://[^ )[\]"'\''<>]+' | head -1)"
-
     if [ -z "$AUTH_URL" ]; then
-        echo "oauth_url_requests.$KEY: no URL in output. Try running manually: openclaw models auth login --provider $PROVIDER" >&2
+        echo "oauth_url_requests.$KEY: no URL captured. Try running manually: openclaw models auth login --provider $PROVIDER" >&2
         continue
     fi
 
@@ -300,6 +333,8 @@ while IFS= read -r KEY || [ -n "$KEY" ]; do
         echo "oauth_url_requests.$KEY: POST failed (HTTP $POST_CODE). Check OPENCLAW_API_BASE=$OPENCLAW_API_BASE" >&2
     fi
 done <<< "$OAUTH_URL_REQUESTS_RAW"
+
+rm -rf "$FAKE_BIN_DIR"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3) oauth_pending: apply tokens/URLs, then mark consumed
