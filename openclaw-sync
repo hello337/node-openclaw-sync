@@ -134,24 +134,40 @@ while IFS= read -r KEY || [ -n "$KEY" ]; do
     fi
 done <<< "$OAUTH_URL_REQUESTS_RAW"
 
-# OpenClaw issue #22972: health check times out on slow startups (~10s+ with plugins).
-# So when we restart here, we do NOT run Phase B in the same run — exit and let the next run (~10s later) fetch the auth URL when the gateway is ready.
+# Gateway restart with loop-prevention: `openclaw gateway start` may return non-zero purely
+# because its built-in health check times out on slow startups with plugins (OpenClaw #22972).
+# The daemon IS running — it just wasn't "healthy" within the CLI timeout. We always exit 0
+# after starting it and let the *next* run (10s later) proceed to Phase B. A flag file with a
+# 120s cooldown prevents re-restarting the gateway on subsequent runs.
+RESTART_FLAG="/tmp/openclaw-sync-gateway-restarted"
 if [ "$NEED_GATEWAY_RESTART" = "1" ]; then
-    echo "Restarting OpenClaw gateway to apply plugin(s)..." >&2
-    openclaw gateway stop 2>/dev/null || true
-    GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        if ! (lsof -nP -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN 2>/dev/null | grep -q .); then
-            break
+    SKIP_RESTART=0
+    if [ -f "$RESTART_FLAG" ]; then
+        FLAG_MTIME="$(stat -c %Y "$RESTART_FLAG" 2>/dev/null || stat -f %m "$RESTART_FLAG" 2>/dev/null || echo 0)"
+        NOW="$(date +%s)"
+        FLAG_AGE=$(( NOW - FLAG_MTIME ))
+        if [ "$FLAG_AGE" -lt 120 ]; then
+            SKIP_RESTART=1
+            echo "Gateway restart was initiated ${FLAG_AGE}s ago; skipping restart, proceeding to Phase B." >&2
         fi
-        [ "$i" -eq 1 ] && echo "Waiting for gateway port $GATEWAY_PORT to be free..." >&2
-        sleep 1
-    done
-    if openclaw gateway start 2>/dev/null; then
-        echo "Gateway restarted; auth URL will be fetched on next run (in ~10s)." >&2
+    fi
+
+    if [ "$SKIP_RESTART" = "0" ]; then
+        echo "Restarting OpenClaw gateway to apply plugin(s)..." >&2
+        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        openclaw gateway stop 2>&1 || true
+        GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            if ! (lsof -nP -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN 2>/dev/null | grep -q .); then
+                break
+            fi
+            [ "$i" -eq 1 ] && echo "Waiting for gateway port $GATEWAY_PORT to be free..." >&2
+            sleep 1
+        done
+        openclaw gateway start 2>&1 || true
+        touch "$RESTART_FLAG"
+        echo "Gateway restart initiated; auth URL will be fetched on next run (~10s)." >&2
         exit 0
-    else
-        echo "Warning: gateway start failed; run 'openclaw gateway stop' then 'openclaw gateway start' manually." >&2
     fi
 fi
 
@@ -184,6 +200,7 @@ while IFS= read -r KEY || [ -n "$KEY" ]; do
             POST_CODE="$(echo "$POST_RESP" | tail -1)"
             if [ "$POST_CODE" = "200" ] && echo "$POST_RESP" | sed '$d' | jq -e '.ok' >/dev/null 2>&1; then
                 echo "oauth_url_requests.$KEY: auth URL sent to xNode" >&2
+                rm -f "$RESTART_FLAG"
             else
                 echo "oauth_url_requests.$KEY: failed to POST auth URL (HTTP $POST_CODE). Ensure OPENCLAW_API_BASE ($OPENCLAW_API_BASE) is the same API your frontend uses." >&2
             fi

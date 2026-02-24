@@ -122,6 +122,8 @@ sudo ./update.sh
 
 `update.sh` runs `git pull` and restarts the timer.
 
+**If the systemd unit changed** (e.g. new `Environment=` lines), re-run `sudo ./install.sh` after pull to regenerate the unit file and reload systemd.
+
 ---
 
 ## What the script does
@@ -158,7 +160,7 @@ Token and API base are read from the `env` file in the repo root (see `env.examp
   ps -o user= -p $(lsof -t -iTCP:18789 -sTCP:LISTEN 2>/dev/null) 2>/dev/null || echo "No listener on 18789"
   ```
 
-When the script enables a plugin and restarts the gateway, it exits right after `openclaw gateway start` and does **not** fetch the auth URL in the same run. The next run (e.g. in ~10s via the timer) will fetch the URL once the gateway is ready. This avoids a known OpenClaw issue where the gateway needs more than a few seconds to become healthy after restart ([openclaw/openclaw#22972](https://github.com/openclaw/openclaw/issues/22972)).
+When the script enables a plugin and restarts the gateway, it exits right after `openclaw gateway start` and does **not** fetch the auth URL in the same run. A flag file (`/tmp/openclaw-sync-gateway-restarted`) with a 120-second cooldown prevents the script from re-restarting the gateway on subsequent runs — instead, the next run proceeds directly to Phase B (auth URL fetch). `openclaw gateway start` may return non-zero just because its internal health check times out with plugins loaded (OpenClaw [#22972](https://github.com/openclaw/openclaw/issues/22972)); the daemon is still starting. The systemd unit sets `XDG_RUNTIME_DIR=/run/user/0` so that `openclaw gateway start/stop` can manage user-level services from a system service context.
 
 **"Waiting for link" never shows the link**
 

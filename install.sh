@@ -41,6 +41,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+Environment=XDG_RUNTIME_DIR=/run/user/0
 EnvironmentFile=-$INSTALL_DIR/env
 ExecStart=$INSTALL_DIR/openclaw-sync
 StandardOutput=journal
