@@ -71,6 +71,12 @@ run_with_timeout() {
     else "$@" 2>&1; fi
 }
 
+# openclaw gateway call outputs "Gateway call: <method>" on stdout before JSON.
+# This helper strips all non-JSON prefix lines so jq can parse the result.
+gateway_call_json() {
+    openclaw gateway call "$@" 2>/dev/null | sed -n '/^[{[]/,$p'
+}
+
 generate_pkce() {
     local verifier challenge
     verifier="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
@@ -131,18 +137,24 @@ apply_provider_config_patch() {
     command -v openclaw &>/dev/null || { echo "apply_provider_config_patch: openclaw not found, skipping" >&2; return 0; }
 
     local GET_RESP HASH
-    GET_RESP="$(openclaw gateway call config.get --params '{}' 2>/dev/null)" || {
+    GET_RESP="$(gateway_call_json config.get --params '{}')" || {
         echo "apply_provider_config_patch: config.get command failed" >&2; return 1
     }
-    HASH="$(echo "$GET_RESP" | jq -r '.payload.hash // .hash // empty' 2>/dev/null)" || HASH=""
+    if [ -z "$GET_RESP" ]; then
+        echo "apply_provider_config_patch: config.get returned empty response" >&2; return 1
+    fi
+
+    HASH="$(echo "$GET_RESP" | jq -r '.payload.hash // .hash // .configHash // empty' 2>/dev/null)" || HASH=""
     if [ -z "$HASH" ]; then
-        echo "apply_provider_config_patch: could not extract baseHash (response: $(echo "$GET_RESP" | head -c 200))" >&2
+        local resp_keys
+        resp_keys="$(echo "$GET_RESP" | jq -r 'keys | join(", ")' 2>/dev/null)" || resp_keys="(not valid json)"
+        echo "apply_provider_config_patch: could not extract baseHash (keys: $resp_keys)" >&2
         return 1
     fi
 
     local PARAMS PATCH_RESP
     PARAMS="$(jq -n --arg h "$HASH" --arg r "$provider_config_json" '{ baseHash: $h, raw: $r }' 2>/dev/null)" || return 1
-    PATCH_RESP="$(openclaw gateway call config.patch --params "$PARAMS" 2>/dev/null)" || {
+    PATCH_RESP="$(gateway_call_json config.patch --params "$PARAMS")" || {
         echo "apply_provider_config_patch: config.patch command failed" >&2; return 1
     }
     local err
@@ -724,7 +736,11 @@ if [ -n "$TOOLS_WEB_SEARCH" ] && [ "$TOOLS_WEB_SEARCH" != "null" ]; then NEED_PA
 if [ -n "$ENV_JSON" ] && [ "$ENV_JSON" != "null" ] && [ "$ENV_JSON" != "{}" ]; then NEED_PATCH="true"; fi
 
 if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
-    HASH="$(openclaw gateway call config.get --params '{}' 2>/dev/null | jq -r '.payload.hash // .hash // empty' 2>/dev/null)" || HASH=""
+    GET_RESP_MAIN="$(gateway_call_json config.get --params '{}')" || GET_RESP_MAIN=""
+    HASH=""
+    if [ -n "$GET_RESP_MAIN" ]; then
+        HASH="$(echo "$GET_RESP_MAIN" | jq -r '.payload.hash // .hash // .configHash // empty' 2>/dev/null)" || HASH=""
+    fi
     if [ -n "$HASH" ]; then
         RAW_JSON="$(jq -n \
             --argjson ad "${AGENTS_DEFAULTS:-null}" \
@@ -740,9 +756,11 @@ if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
         if [ -n "$RAW_JSON" ] && [ "$RAW_JSON" != "{}" ]; then
             PARAMS="$(jq -n --arg h "$HASH" --arg r "$RAW_JSON" '{ baseHash: $h, raw: $r }' 2>/dev/null)" || true
             if [ -n "$PARAMS" ]; then
-                PATCH_OUT="$(openclaw gateway call config.patch --params "$PARAMS" 2>/dev/null)" || echo "Warning: config.patch failed: $PATCH_OUT" >&2
+                PATCH_OUT="$(gateway_call_json config.patch --params "$PARAMS")" || echo "Warning: config.patch failed" >&2
             fi
         fi
+    else
+        echo "Warning: main config.patch skipped — could not get baseHash" >&2
     fi
 fi
 
