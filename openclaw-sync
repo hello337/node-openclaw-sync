@@ -71,9 +71,21 @@ run_with_timeout() {
     else "$@" 2>&1; fi
 }
 
-# Use --json flag for machine-parseable output (no banner, no ANSI codes).
+# Call gateway RPC and return clean JSON. Strips ANSI banner, retries on failure.
 gateway_call_json() {
-    openclaw gateway call --json "$@" 2>/dev/null
+    local _attempt
+    for _attempt in 1 2 3; do
+        local _raw _json
+        _raw="$(openclaw gateway call "$@" 2>/dev/null)" || { sleep 2; continue; }
+        [ -z "$_raw" ] && { sleep 2; continue; }
+        _json="$(echo "$_raw" | strip_ansi | sed -n '/^[[:space:]]*[{[]/,$p')"
+        if [ -n "$_json" ] && echo "$_json" | jq -e '.' &>/dev/null; then
+            echo "$_json"
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
 }
 
 generate_pkce() {
