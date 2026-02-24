@@ -105,13 +105,24 @@ save_auth_profile() {
 
 apply_provider_config_patch() {
     local provider_config_json="$1"
-    command -v openclaw &>/dev/null || return 0
-    local HASH
-    HASH="$(openclaw gateway call config.get --params '{}' 2>/dev/null | jq -r '.payload.hash // .hash // empty' 2>/dev/null)" || HASH=""
-    [ -z "$HASH" ] && return 0
-    local PARAMS
-    PARAMS="$(jq -n --arg h "$HASH" --arg r "$provider_config_json" '{ baseHash: $h, raw: $r }' 2>/dev/null)" || return 0
-    openclaw gateway call config.patch --params "$PARAMS" 2>/dev/null || return 1
+    command -v openclaw &>/dev/null || { echo "apply_provider_config_patch: openclaw not found, skipping" >&2; return 0; }
+    local GET_RESP HASH
+    GET_RESP="$(openclaw gateway call config.get --params '{}' 2>&1)" || { echo "apply_provider_config_patch: config.get failed" >&2; return 1; }
+    HASH="$(echo "$GET_RESP" | jq -r '.payload.hash // .hash // empty' 2>/dev/null)" || HASH=""
+    if [ -z "$HASH" ]; then
+        echo "apply_provider_config_patch: could not extract baseHash" >&2; return 1
+    fi
+    local PARAMS PATCH_RESP
+    PARAMS="$(jq -n --arg h "$HASH" --arg r "$provider_config_json" '{ baseHash: $h, raw: $r }' 2>/dev/null)" || return 1
+    PATCH_RESP="$(openclaw gateway call config.patch --params "$PARAMS" 2>&1)" || {
+        echo "apply_provider_config_patch: config.patch FAILED: $PATCH_RESP" >&2; return 1
+    }
+    local err
+    err="$(echo "$PATCH_RESP" | jq -r '.error // empty' 2>/dev/null)"
+    if [ -n "$err" ]; then
+        echo "apply_provider_config_patch: config.patch returned error: $err" >&2; return 1
+    fi
+    return 0
 }
 
 post_oauth_consumed() {
@@ -174,7 +185,7 @@ save_qwen_token() {
     local access="$1" refresh="$2" expires="$3" resource_url="$4"
     save_auth_profile "qwen-portal:default" \
         "$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" \
-        '{ type: "oauth", provider: "qwen-portal", access: $a, refresh: $r, expires: $e }')" \
+        '{ provider: "qwen-portal", access: $a, refresh: $r, expires: $e }')" \
         || { echo "qwen_portal: failed to save profile" >&2; return 1; }
     echo "qwen_portal: saved OAuth token" >&2
 
@@ -185,6 +196,12 @@ save_qwen_token() {
 
     local cfg
     cfg="$(jq -n --arg bu "$base_url" '{
+        auth: {
+            profiles: {
+                "qwen-portal:default": { provider: "qwen-portal", mode: "oauth" }
+            },
+            order: { "qwen-portal": ["qwen-portal:default"] }
+        },
         models: { providers: { "qwen-portal": {
             baseUrl: $bu, apiKey: "qwen-oauth", api: "openai-completions",
             models: [
@@ -195,7 +212,7 @@ save_qwen_token() {
             ]
         }}},
         agents: { defaults: {
-            model: "qwen-portal/coder-model",
+            model: { primary: "qwen-portal/coder-model" },
             models: {
                 "qwen-portal/coder-model": { alias: "qwen" },
                 "qwen-portal/vision-model": {}
@@ -228,15 +245,21 @@ gh_poll_token() {
 
 save_github_copilot_token() {
     local token="$1"
-    save_auth_profile "github-copilot:github" \
-        "$(jq -n --arg t "$token" '{ type: "token", provider: "github-copilot", token: $t }')" \
+    save_auth_profile "github-copilot:default" \
+        "$(jq -n --arg t "$token" '{ provider: "github-copilot", key: $t }')" \
         || { echo "github_copilot: failed to save profile" >&2; return 1; }
     echo "github_copilot: saved GitHub token" >&2
 
     local cfg
     cfg="$(jq -n '{
+        auth: {
+            profiles: {
+                "github-copilot:default": { provider: "github-copilot", mode: "oauth" }
+            },
+            order: { "github-copilot": ["github-copilot:default"] }
+        },
         agents: { defaults: {
-            model: "github-copilot/claude-opus-4-5",
+            model: { primary: "github-copilot/claude-opus-4-5" },
             models: {
                 "github-copilot/claude-opus-4-5": { alias: "copilot" }
             }
@@ -272,7 +295,7 @@ save_minimax_token() {
     local access="$1" refresh="$2" expires="$3" resource_url="$4"
     save_auth_profile "minimax-portal:default" \
         "$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" \
-        '{ type: "oauth", provider: "minimax-portal", access: $a, refresh: $r, expires: $e }')" \
+        '{ provider: "minimax-portal", access: $a, refresh: $r, expires: $e }')" \
         || { echo "minimax_portal: failed to save profile" >&2; return 1; }
     echo "minimax_portal: saved OAuth token" >&2
 
@@ -280,6 +303,12 @@ save_minimax_token() {
     [ -n "$resource_url" ] && [ "$resource_url" != "null" ] && base_url="$resource_url"
     local cfg
     cfg="$(jq -n --arg bu "$base_url" '{
+        auth: {
+            profiles: {
+                "minimax-portal:default": { provider: "minimax-portal", mode: "oauth" }
+            },
+            order: { "minimax-portal": ["minimax-portal:default"] }
+        },
         models: { providers: { "minimax-portal": {
             baseUrl: $bu, apiKey: "minimax-oauth", api: "anthropic-messages",
             models: [
@@ -290,7 +319,7 @@ save_minimax_token() {
             ]
         }}},
         agents: { defaults: {
-            model: "minimax-portal/MiniMax-M2.1",
+            model: { primary: "minimax-portal/MiniMax-M2.1" },
             models: {
                 "minimax-portal/MiniMax-M2.1": { alias: "minimax" },
                 "minimax-portal/MiniMax-M2.5": {}
@@ -327,14 +356,20 @@ save_openai_codex_token() {
     local access="$1" refresh="$2" expires="$3"
     save_auth_profile "openai-codex:default" \
         "$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" \
-        '{ type: "oauth", provider: "openai-codex", access: $a, refresh: $r, expires: $e }')" \
+        '{ provider: "openai-codex", access: $a, refresh: $r, expires: $e }')" \
         || { echo "openai_codex: failed to save profile" >&2; return 1; }
     echo "openai_codex: saved OAuth token" >&2
 
     local cfg
     cfg="$(jq -n '{
+        auth: {
+            profiles: {
+                "openai-codex:default": { provider: "openai-codex", mode: "oauth" }
+            },
+            order: { "openai-codex": ["openai-codex:default"] }
+        },
         agents: { defaults: {
-            model: "openai-codex/gpt-5.3-codex",
+            model: { primary: "openai-codex/gpt-5.3-codex" },
             models: {
                 "openai-codex/gpt-5.3-codex": { alias: "codex" }
             }
@@ -423,13 +458,19 @@ save_gemini_cli_token() {
     local access="$1" refresh="$2" expires="$3" project_id="$4"
     local profile
     profile="$(jq -n --arg a "$access" --arg r "$refresh" --argjson e "$expires" --arg p "$project_id" \
-        '{ type: "oauth", provider: "google-gemini-cli", access: $a, refresh: $r, expires: $e } + (if $p != "" then { projectId: $p } else {} end)')"
+        '{ provider: "google-gemini-cli", access: $a, refresh: $r, expires: $e } + (if $p != "" then { projectId: $p } else {} end)')"
     save_auth_profile "google-gemini-cli:default" "$profile" \
         || { echo "google_gemini_cli: failed to save profile" >&2; return 1; }
     echo "google_gemini_cli: saved OAuth token (project: ${project_id:-none})" >&2
 
     local cfg
     cfg="$(jq -n '{
+        auth: {
+            profiles: {
+                "google-gemini-cli:default": { provider: "google-gemini-cli", mode: "oauth" }
+            },
+            order: { "google-gemini-cli": ["google-gemini-cli:default"] }
+        },
         models: { providers: { "google-gemini-cli": {
             apiKey: "gemini-cli-oauth", api: "gemini",
             models: [
@@ -440,7 +481,7 @@ save_gemini_cli_token() {
             ]
         }}},
         agents: { defaults: {
-            model: "google-gemini-cli/gemini-3-pro-preview",
+            model: { primary: "google-gemini-cli/gemini-3-pro-preview" },
             models: {
                 "google-gemini-cli/gemini-3-pro-preview": { alias: "gemini" },
                 "google-gemini-cli/gemini-3-flash-preview": {}
@@ -573,15 +614,44 @@ RESP="$RESP_BODY"
 command -v openclaw &>/dev/null && openclaw config set gateway.controlUi.allowInsecureAuth true 2>/dev/null || true
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1) Apply agents_defaults and tools_web_search via config.patch
+# 1) Write API keys to ~/.openclaw/.env + apply config via config.patch
 # ──────────────────────────────────────────────────────────────────────────────
 
+ENV_JSON="$(echo "$RESP" | jq -c '.env // empty' 2>/dev/null)" || ENV_JSON=""
 AGENTS_DEFAULTS="$(echo "$RESP" | jq -c '.agents_defaults // empty' 2>/dev/null)" || AGENTS_DEFAULTS=""
 TOOLS_WEB_SEARCH="$(echo "$RESP" | jq -c '.tools_web_search // empty' 2>/dev/null)" || TOOLS_WEB_SEARCH=""
+
+# Write API keys to ~/.openclaw/.env (primary source for env vars)
+if [ -n "$ENV_JSON" ] && [ "$ENV_JSON" != "null" ] && [ "$ENV_JSON" != "{}" ]; then
+    OPENCLAW_ENV_FILE="$OPENCLAW_STATE_DIR/.env"
+    mkdir -p "$OPENCLAW_STATE_DIR"
+
+    EXISTING_ENV=""
+    [ -f "$OPENCLAW_ENV_FILE" ] && EXISTING_ENV="$(cat "$OPENCLAW_ENV_FILE" 2>/dev/null)" || true
+
+    NEW_ENV="$EXISTING_ENV"
+    while IFS='=' read -r ekey eval; do
+        [ -z "$ekey" ] && continue
+        ESCAPED_VAL="$(printf '%s' "$eval" | sed "s/'/'\\\\''/g")"
+        if echo "$NEW_ENV" | grep -q "^${ekey}="; then
+            NEW_ENV="$(echo "$NEW_ENV" | sed "s|^${ekey}=.*|${ekey}='${ESCAPED_VAL}'|")"
+        else
+            [ -n "$NEW_ENV" ] && NEW_ENV="${NEW_ENV}"$'\n'"${ekey}='${ESCAPED_VAL}'" || NEW_ENV="${ekey}='${ESCAPED_VAL}'"
+        fi
+    done < <(echo "$ENV_JSON" | jq -r 'to_entries[] | select(.value != null and (.value | tostring | length) > 0) | "\(.key)=\(.value)"' 2>/dev/null)
+
+    if [ "$NEW_ENV" != "$EXISTING_ENV" ]; then
+        echo "$NEW_ENV" > "$OPENCLAW_ENV_FILE"
+        echo "env: updated $OPENCLAW_ENV_FILE ($(echo "$ENV_JSON" | jq 'keys | length' 2>/dev/null) keys)" >&2
+    fi
+fi
+
+# Build and apply config.patch (agents_defaults + tools_web_search + env)
 NEED_PATCH="false"
 if [ -n "$AGENTS_DEFAULTS" ] && [ "$AGENTS_DEFAULTS" != "null" ] && \
    [ "$(echo "$AGENTS_DEFAULTS" | jq -r 'keys | length' 2>/dev/null)" -gt 0 ] 2>/dev/null; then NEED_PATCH="true"; fi
 if [ -n "$TOOLS_WEB_SEARCH" ] && [ "$TOOLS_WEB_SEARCH" != "null" ]; then NEED_PATCH="true"; fi
+if [ -n "$ENV_JSON" ] && [ "$ENV_JSON" != "null" ] && [ "$ENV_JSON" != "{}" ]; then NEED_PATCH="true"; fi
 
 if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
     HASH="$(openclaw gateway call config.get --params '{}' 2>/dev/null | jq -r '.payload.hash // .hash // empty' 2>/dev/null)" || HASH=""
@@ -589,14 +659,19 @@ if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
         RAW_JSON="$(jq -n \
             --argjson ad "${AGENTS_DEFAULTS:-null}" \
             --argjson tw "${TOOLS_WEB_SEARCH:-null}" \
+            --argjson ev "${ENV_JSON:-null}" \
             '(if $ad != null and ($ad | type) == "object" and ($ad | keys | length) > 0
               then { agents: { defaults: $ad } } else {} end)
            * (if $tw != null and ($tw | type) == "object" and ($tw | keys | length) > 0
-              then { tools: { web: { search: $tw } } } else {} end)' \
+              then { tools: { web: { search: $tw } } } else {} end)
+           * (if $ev != null and ($ev | type) == "object" and ($ev | keys | length) > 0
+              then { env: $ev } else {} end)' \
             2>/dev/null | jq -c . 2>/dev/null)" || RAW_JSON=""
         if [ -n "$RAW_JSON" ] && [ "$RAW_JSON" != "{}" ]; then
             PARAMS="$(jq -n --arg h "$HASH" --arg r "$RAW_JSON" '{ baseHash: $h, raw: $r }' 2>/dev/null)" || true
-            [ -n "$PARAMS" ] && openclaw gateway call config.patch --params "$PARAMS" 2>/dev/null || echo "Warning: config.patch failed" >&2
+            if [ -n "$PARAMS" ]; then
+                PATCH_OUT="$(openclaw gateway call config.patch --params "$PARAMS" 2>&1)" || echo "Warning: config.patch failed: $PATCH_OUT" >&2
+            fi
         fi
     fi
 fi
