@@ -50,6 +50,12 @@ echo "env: HOME=$HOME OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR PROFILES_FILE=$PROF
 if ! command -v jq &>/dev/null; then echo "jq is required." >&2; exit 1; fi
 if ! command -v openssl &>/dev/null; then echo "openssl is required." >&2; exit 1; fi
 
+# Auto-install @google/gemini-cli for Gemini OAuth credentials extraction
+if ! command -v gemini &>/dev/null && command -v npm &>/dev/null; then
+    echo "gemini-cli not found, installing @google/gemini-cli..." >&2
+    npm install -g @google/gemini-cli 2>&1 | tail -1 >&2 || echo "gemini-cli install failed (non-fatal)" >&2
+fi
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -836,11 +842,8 @@ if [ -d "$DEVICE_CODE_STATE_DIR" ]; then
     done
 fi
 
-# Full restart if any OAuth tokens were saved in Phase 0 polling
-if [ "$OAUTH_TOKEN_SAVED" = "1" ]; then
-    full_gateway_restart
-    OAUTH_TOKEN_SAVED=0
-fi
+# NOTE: don't restart here — defer to a single restart after Phase 3
+# to avoid double-restart when tokens arrive in both Phase 0 and Phase 3.
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 0) Fetch config from xNode
@@ -1137,7 +1140,13 @@ done <<< "$OAUTH_URL_REQUESTS_RAW"
 # ──────────────────────────────────────────────────────────────────────────────
 
 OAUTH_PENDING_KEYS="$(echo "$RESP" | jq -r '.oauth_pending // {} | keys[]' 2>/dev/null)" || true
-[ -z "$OAUTH_PENDING_KEYS" ] && exit 0
+if [ -z "$OAUTH_PENDING_KEYS" ]; then
+    if [ "$OAUTH_TOKEN_SAVED" = "1" ]; then
+        full_gateway_restart
+        OAUTH_TOKEN_SAVED=0
+    fi
+    exit 0
+fi
 
 CONSUMED=()
 while IFS= read -r KEY || [ -n "$KEY" ]; do
@@ -1253,7 +1262,7 @@ while IFS= read -r KEY || [ -n "$KEY" ]; do
     esac
 done <<< "$OAUTH_PENDING_KEYS"
 
-# Full restart if any OAuth tokens were saved in Phase 3
+# Single full restart if any OAuth tokens were saved (Phase 0 or Phase 3)
 if [ "$OAUTH_TOKEN_SAVED" = "1" ]; then
     full_gateway_restart
     OAUTH_TOKEN_SAVED=0
