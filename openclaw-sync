@@ -1011,9 +1011,11 @@ while IFS= read -r KEY || [ -n "$KEY" ]; do
     KEY="$(echo "${KEY:-}" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$KEY" ] && continue
 
-    # Skip if state file already exists (pending poll or pending redirect)
-    [ -f "$DEVICE_CODE_STATE_DIR/$KEY.json" ] && {
-        echo "oauth_url_requests.$KEY: already pending, skipping" >&2; continue; }
+    # If state file exists but user explicitly re-requested, clear stale state
+    if [ -f "$DEVICE_CODE_STATE_DIR/$KEY.json" ]; then
+        echo "oauth_url_requests.$KEY: re-requested, clearing previous state" >&2
+        rm -f "$DEVICE_CODE_STATE_DIR/$KEY.json"
+    fi
 
     AUTH_URL=""
 
