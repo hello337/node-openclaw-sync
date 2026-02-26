@@ -32,16 +32,31 @@ nano env  # set OPENCLAW_CONFIG_TOKEN
 
 ### 2. Install systemd timer
 
+**With root (recommended on a dedicated server):**
 ```bash
 chmod +x install.sh
 sudo ./install.sh
 ```
 
+**Without root (regular user, no sudo):**
+```bash
+chmod +x install-user.sh
+./install-user.sh
+```
+This installs a **user** systemd timer (same “every 10s” behaviour); commands then use `systemctl --user` and `journalctl --user`.
+
 ### 3. Verify
 
+**If you used `install.sh` (root):**
 ```bash
 systemctl status openclaw-sync.timer
 journalctl -u openclaw-sync.service -f
+```
+
+**If you used `install-user.sh` (no root):**
+```bash
+systemctl --user status openclaw-sync.timer
+journalctl --user -u openclaw-sync.service -f
 ```
 
 ---
@@ -88,6 +103,23 @@ Simple pipe: `echo "$token" | openclaw models auth paste-token --provider anthro
 2. Clone this repo, set `OPENCLAW_CONFIG_TOKEN`, run `sudo ./install.sh`.
 3. Script auto-sets `gateway.controlUi.allowInsecureAuth true` for localhost.
 4. Test: `./openclaw-sync`.
+
+---
+
+## Running without root (no sudo)
+
+Use **`./install-user.sh`** (no sudo): it creates systemd user units and enables the same “every 10s” timer. Behaviour is the same as with `sudo ./install.sh`, only the units live under your user (`~/.config/systemd/user/`) and you use `systemctl --user` / `journalctl --user`.
+
+- **Paths:** State and temp dirs use `$HOME/.openclaw` and per-user `/tmp/...`, so no root-only paths.
+- **OpenClaw & deps:** Install OpenClaw (and `jq`, `openssl`, `curl`) for this user. Gateway must run as the same user.
+- **After logout (e.g. SSH):** To keep the timer running, run once (needs root on the server): `sudo loginctl enable-linger $(whoami)`. The install script will remind you if linger is off.
+
+**Alternative: cron** (if you prefer not to use systemd user, e.g. run once per minute):
+
+```bash
+crontab -e
+# Add (replace path): * * * * * /path/to/node-openclaw-sync/openclaw-sync >> /path/to/node-openclaw-sync/sync.log 2>&1
+```
 
 ## Updating
 

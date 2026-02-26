@@ -31,15 +31,25 @@ OPENCLAW_API_BASE="${OPENCLAW_API_BASE%/}"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
-# systemd services often have empty HOME — resolve from /etc/passwd
+# systemd/cron often have empty HOME — resolve from passwd; never assume /root for non-root
 if [ -z "$HOME" ]; then
-    HOME="$(getent passwd "$(whoami)" 2>/dev/null | cut -d: -f6)" || HOME="/root"
+    HOME="$(getent passwd "$(whoami)" 2>/dev/null | cut -d: -f6)"
+    if [ -z "$HOME" ]; then
+        if [ "$(id -u)" -eq 0 ]; then
+            HOME="/root"
+        else
+            echo "Cannot determine HOME (set HOME in env or run from a proper login)." >&2
+            exit 1
+        fi
+    fi
     export HOME
 fi
 
 OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
-DEVICE_CODE_STATE_DIR="/tmp/openclaw-sync-device-codes"
-RESTART_FLAG="/tmp/openclaw-sync-gateway-restarted"
+# Per-user temp dirs so non-root and root do not share state
+_UID="$(id -u 2>/dev/null)" || _UID=""
+DEVICE_CODE_STATE_DIR="${DEVICE_CODE_STATE_DIR:-/tmp/openclaw-sync-device-codes${_UID:+-$_UID}}"
+RESTART_FLAG="${RESTART_FLAG:-/tmp/openclaw-sync-gateway-restarted${_UID:+-$_UID}}"
 PROFILES_FILE="$OPENCLAW_STATE_DIR/agents/main/agent/auth-profiles.json"
 
 # Track whether a full gateway restart is needed (auth-profiles.json changed)
@@ -674,7 +684,7 @@ save_gemini_cli_token() {
 # Gateway init: allowInsecureAuth + enable bundled auth plugins (once)
 # ──────────────────────────────────────────────────────────────────────────────
 
-GATEWAY_INIT_FLAG="/tmp/openclaw-sync-gateway-init-done"
+GATEWAY_INIT_FLAG="${GATEWAY_INIT_FLAG:-/tmp/openclaw-sync-gateway-init-done${_UID:+-$_UID}}"
 if command -v openclaw &>/dev/null; then
     if [ ! -f "$GATEWAY_INIT_FLAG" ]; then
         echo "gateway_init: first run — configuring plugins and settings" >&2
@@ -876,10 +886,13 @@ if [ -n "$ENV_JSON" ] && [ "$ENV_JSON" != "null" ] && [ "$ENV_JSON" != "{}" ]; t
     while IFS='=' read -r ekey eval; do
         [ -z "$ekey" ] && continue
         ESCAPED_VAL="$(printf '%s' "$eval" | sed "s/'/'\\\\''/g")"
+        NEW_LINE="${ekey}='${ESCAPED_VAL}'"
         if echo "$NEW_ENV" | grep -q "^${ekey}="; then
-            NEW_ENV="$(echo "$NEW_ENV" | sed "s|^${ekey}=.*|${ekey}='${ESCAPED_VAL}'|")"
+            NEW_ENV="$(echo "$NEW_ENV" | while IFS= read -r line; do
+                case "$line" in "${ekey}="*) printf '%s\n' "$NEW_LINE" ;; *) printf '%s\n' "$line" ;; esac
+            done)"
         else
-            [ -n "$NEW_ENV" ] && NEW_ENV="${NEW_ENV}"$'\n'"${ekey}='${ESCAPED_VAL}'" || NEW_ENV="${ekey}='${ESCAPED_VAL}'"
+            [ -n "$NEW_ENV" ] && NEW_ENV="${NEW_ENV}"$'\n'"${NEW_LINE}" || NEW_ENV="$NEW_LINE"
         fi
     done < <(echo "$ENV_JSON" | jq -r 'to_entries[] | select(.value != null and (.value | tostring | length) > 0) | "\(.key)=\(.value)"' 2>/dev/null)
 
