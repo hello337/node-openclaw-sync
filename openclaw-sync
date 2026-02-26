@@ -45,7 +45,16 @@ if [ -z "$HOME" ]; then
     export HOME
 fi
 
-OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/home/openclaw/.openclaw}"
+# When state dir is under a user home (e.g. /home/openclaw/.openclaw), add that user's common bin paths
+# so `openclaw` CLI (e.g. from npm install -g) is found when script runs from cron/systemd
+if [[ "$OPENCLAW_STATE_DIR" == */.openclaw ]]; then
+    _openclaw_user_home="${OPENCLAW_STATE_DIR%/.openclaw}"
+    for _bin in "$_openclaw_user_home/.npm-global/bin" "$_openclaw_user_home/.local/bin" "$_openclaw_user_home/bin"; do
+        [ -d "$_bin" ] && PATH="$_bin:$PATH"
+    done
+    unset _openclaw_user_home _bin
+fi
 # Per-user temp dirs so non-root and root do not share state
 _UID="$(id -u 2>/dev/null)" || _UID=""
 DEVICE_CODE_STATE_DIR="${DEVICE_CODE_STATE_DIR:-/tmp/openclaw-sync-device-codes${_UID:+-$_UID}}"
