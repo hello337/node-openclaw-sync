@@ -123,11 +123,19 @@ crontab -e
 
 ## Updating
 
+**If you used `install.sh` (root):**
 ```bash
 cd /path/to/node-openclaw-sync
-sudo git pull
-sudo systemctl restart openclaw-sync.timer
+sudo ./update.sh
 ```
+(`update.sh` does `git pull` and restarts the system timer.)
+
+**If you used `install-user.sh` (no root):**
+```bash
+cd /path/to/node-openclaw-sync
+./update-user.sh
+```
+(`update-user.sh` does `git pull` and restarts the user timer; no sudo.)
 
 ---
 

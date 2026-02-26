@@ -80,6 +80,7 @@ systemctl --user start openclaw-sync.timer
 echo "Done. Timer runs every 10s (user systemd)."
 echo "  Status: systemctl --user status openclaw-sync.timer"
 echo "  Logs:   journalctl --user -u openclaw-sync.service -f"
+echo "  Update: ./update-user.sh  (after git pull, no sudo)"
 if ! loginctl show-user "$(whoami)" 2>/dev/null | grep -q 'Linger=yes'; then
     echo ""
     echo "To keep the timer running after you log out (e.g. over SSH), run once (needs root):"
