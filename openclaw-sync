@@ -64,7 +64,7 @@ PROFILES_FILE="$OPENCLAW_STATE_DIR/agents/main/agent/auth-profiles.json"
 # Track whether a full gateway restart is needed (auth-profiles.json changed)
 OAUTH_TOKEN_SAVED=0
 
-echo "env: HOME=$HOME OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR PROFILES_FILE=$PROFILES_FILE" >&2
+echo "env: HOME=$HOME OPENCLAW_API_BASE=$OPENCLAW_API_BASE OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR PROFILES_FILE=$PROFILES_FILE" >&2
 
 if ! command -v jq &>/dev/null; then echo "jq is required." >&2; exit 1; fi
 if ! command -v openssl &>/dev/null; then echo "openssl is required." >&2; exit 1; fi
@@ -868,10 +868,16 @@ fi
 # 0) Fetch config from xNode
 # ──────────────────────────────────────────────────────────────────────────────
 
-RESP="$(curl -s -S -w "\n%{http_code}" -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" "$OPENCLAW_API_BASE/openclaw/config")"
+CONFIG_URL="$OPENCLAW_API_BASE/openclaw/config"
+RESP="$(curl -s -S -w "\n%{http_code}" -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" "$CONFIG_URL")"
 HTTP_CODE="$(echo "$RESP" | tail -1)"
 RESP_BODY="$(echo "$RESP" | sed '$d')"
-if [ "$HTTP_CODE" != "200" ]; then echo "Failed to fetch config: HTTP $HTTP_CODE" >&2; exit 1; fi
+if [ "$HTTP_CODE" != "200" ]; then
+    echo "Failed to fetch config: HTTP $HTTP_CODE" >&2
+    echo "  URL: $CONFIG_URL" >&2
+    echo "  Check OPENCLAW_API_BASE in env (no trailing slash; e.g. https://api.xnode.pro). For wrong token backend returns 401, not 404." >&2
+    exit 1
+fi
 if ! echo "$RESP_BODY" | jq -e . >/dev/null 2>&1; then echo "Config response is not valid JSON" >&2; exit 1; fi
 RESP="$RESP_BODY"
 
