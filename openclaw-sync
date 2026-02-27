@@ -918,44 +918,54 @@ if [ -n "$ENV_JSON" ] && [ "$ENV_JSON" != "null" ] && [ "$ENV_JSON" != "{}" ]; t
 fi
 
 # Build and apply config.patch (agents_defaults + tools_web_search + env)
+# Skip gateway call when payload unchanged to reduce CPU load (was every 10s)
 NEED_PATCH="false"
 if [ -n "$AGENTS_DEFAULTS" ] && [ "$AGENTS_DEFAULTS" != "null" ] && \
    [ "$(echo "$AGENTS_DEFAULTS" | jq -r 'keys | length' 2>/dev/null)" -gt 0 ] 2>/dev/null; then NEED_PATCH="true"; fi
 if [ -n "$TOOLS_WEB_SEARCH" ] && [ "$TOOLS_WEB_SEARCH" != "null" ]; then NEED_PATCH="true"; fi
 if [ -n "$ENV_JSON" ] && [ "$ENV_JSON" != "null" ] && [ "$ENV_JSON" != "{}" ]; then NEED_PATCH="true"; fi
 
+MAIN_PATCH_HASH_FILE="${DEVICE_CODE_STATE_DIR:-/tmp/openclaw-sync-device-codes}/last_main_patch_hash"
 if [ "$NEED_PATCH" = "true" ] && command -v openclaw &>/dev/null; then
-    GET_RESP_MAIN="$(gateway_call_json config.get --params '{}')" || GET_RESP_MAIN=""
-    HASH=""
-    if [ -n "$GET_RESP_MAIN" ]; then
-        HASH="$(echo "$GET_RESP_MAIN" | jq -r '.hash // empty' 2>/dev/null)" || HASH=""
-        if [ -z "$HASH" ]; then
-            _keys="$(echo "$GET_RESP_MAIN" | jq -r 'keys | join(", ")' 2>/dev/null)" || _keys="?"
-            echo "Warning: config.get returned JSON but no hash field (keys: $_keys)" >&2
-        fi
+    CURRENT_PAYLOAD_HASH="$(printf '%s' "${AGENTS_DEFAULTS:-}${TOOLS_WEB_SEARCH:-}${ENV_JSON:-}" | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null)" || true
+    LAST_HASH=""
+    [ -f "$MAIN_PATCH_HASH_FILE" ] && LAST_HASH="$(cat "$MAIN_PATCH_HASH_FILE" 2>/dev/null)" || true
+    if [ -n "$CURRENT_PAYLOAD_HASH" ] && [ "$CURRENT_PAYLOAD_HASH" = "$LAST_HASH" ]; then
+        : # main config unchanged, skip config.get + config.patch to reduce gateway load
     else
-        echo "Warning: config.get returned empty (gateway may be restarting)" >&2
-    fi
-    if [ -n "$HASH" ]; then
-        RAW_JSON="$(jq -n \
-            --argjson ad "${AGENTS_DEFAULTS:-null}" \
-            --argjson tw "${TOOLS_WEB_SEARCH:-null}" \
-            --argjson ev "${ENV_JSON:-null}" \
-            '(if $ad != null and ($ad | type) == "object" and ($ad | keys | length) > 0
-              then { agents: { defaults: $ad } } else {} end)
-           * (if $tw != null and ($tw | type) == "object" and ($tw | keys | length) > 0
-              then { tools: { web: { search: $tw } } } else {} end)
-           * (if $ev != null and ($ev | type) == "object" and ($ev | keys | length) > 0
-              then { env: $ev } else {} end)' \
-            2>/dev/null | jq -c . 2>/dev/null)" || RAW_JSON=""
-        if [ -n "$RAW_JSON" ] && [ "$RAW_JSON" != "{}" ]; then
-            PARAMS="$(jq -n --arg h "$HASH" --arg r "$RAW_JSON" '{ baseHash: $h, raw: $r }' 2>/dev/null)" || true
-            if [ -n "$PARAMS" ]; then
-                PATCH_OUT="$(gateway_call_json config.patch --params "$PARAMS")" || echo "Warning: config.patch failed" >&2
+        GET_RESP_MAIN="$(gateway_call_json config.get --params '{}')" || GET_RESP_MAIN=""
+        HASH=""
+        if [ -n "$GET_RESP_MAIN" ]; then
+            HASH="$(echo "$GET_RESP_MAIN" | jq -r '.hash // empty' 2>/dev/null)" || HASH=""
+            if [ -z "$HASH" ]; then
+                _keys="$(echo "$GET_RESP_MAIN" | jq -r 'keys | join(", ")' 2>/dev/null)" || _keys="?"
+                echo "Warning: config.get returned JSON but no hash field (keys: $_keys)" >&2
             fi
+        else
+            echo "Warning: config.get returned empty (gateway may be restarting)" >&2
         fi
-    else
-        echo "Warning: main config.patch skipped — could not get baseHash" >&2
+        if [ -n "$HASH" ]; then
+            RAW_JSON="$(jq -n \
+                --argjson ad "${AGENTS_DEFAULTS:-null}" \
+                --argjson tw "${TOOLS_WEB_SEARCH:-null}" \
+                --argjson ev "${ENV_JSON:-null}" \
+                '(if $ad != null and ($ad | type) == "object" and ($ad | keys | length) > 0
+                  then { agents: { defaults: $ad } } else {} end)
+               * (if $tw != null and ($tw | type) == "object" and ($tw | keys | length) > 0
+                  then { tools: { web: { search: $tw } } } else {} end)
+               * (if $ev != null and ($ev | type) == "object" and ($ev | keys | length) > 0
+                  then { env: $ev } else {} end)' \
+                2>/dev/null | jq -c . 2>/dev/null)" || RAW_JSON=""
+            if [ -n "$RAW_JSON" ] && [ "$RAW_JSON" != "{}" ]; then
+                PARAMS="$(jq -n --arg h "$HASH" --arg r "$RAW_JSON" '{ baseHash: $h, raw: $r }' 2>/dev/null)" || true
+                if [ -n "$PARAMS" ]; then
+                    PATCH_OUT="$(gateway_call_json config.patch --params "$PARAMS")" || echo "Warning: config.patch failed" >&2
+                    [ -n "$CURRENT_PAYLOAD_HASH" ] && mkdir -p "$(dirname "$MAIN_PATCH_HASH_FILE")" && printf '%s' "$CURRENT_PAYLOAD_HASH" > "$MAIN_PATCH_HASH_FILE" 2>/dev/null || true
+                fi
+            fi
+        else
+            echo "Warning: main config.patch skipped — could not get baseHash" >&2
+        fi
     fi
 fi
 
