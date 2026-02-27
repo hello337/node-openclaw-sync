@@ -60,14 +60,51 @@ _UID="$(id -u 2>/dev/null)" || _UID=""
 DEVICE_CODE_STATE_DIR="${DEVICE_CODE_STATE_DIR:-/tmp/openclaw-sync-device-codes${_UID:+-$_UID}}"
 RESTART_FLAG="${RESTART_FLAG:-/tmp/openclaw-sync-gateway-restarted${_UID:+-$_UID}}"
 PROFILES_FILE="$OPENCLAW_STATE_DIR/agents/main/agent/auth-profiles.json"
+RUN_LOCK_FILE="${RUN_LOCK_FILE:-/tmp/openclaw-sync.run.lock${_UID:+-$_UID}}"
+CONFIG_HASH_FILE="${CONFIG_HASH_FILE:-/tmp/openclaw-sync-config-hash${_UID:+-$_UID}}"
+
+# Prevent overlapping runs (e.g. timer fired again before previous run finished)
+if [ -f "$RUN_LOCK_FILE" ]; then
+    OLD_PID="$(cat "$RUN_LOCK_FILE" 2>/dev/null)"
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "Previous run (PID $OLD_PID) still active, skipping this run." >&2
+        exit 0
+    fi
+fi
+echo $$ > "$RUN_LOCK_FILE"
+trap 'if [ $? -eq 0 ] && [ "${SAVE_CONFIG_HASH_ON_EXIT:-0}" = "1" ] && [ -n "${CURRENT_CONFIG_HASH:-}" ]; then printf "%s" "$CURRENT_CONFIG_HASH" > "$CONFIG_HASH_FILE" 2>/dev/null; fi; rm -f "$RUN_LOCK_FILE"' EXIT
 
 # Track whether a full gateway restart is needed (auth-profiles.json changed)
 OAUTH_TOKEN_SAVED=0
 
-echo "env: HOME=$HOME OPENCLAW_API_BASE=$OPENCLAW_API_BASE OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR PROFILES_FILE=$PROFILES_FILE" >&2
-
 if ! command -v jq &>/dev/null; then echo "jq is required." >&2; exit 1; fi
 if ! command -v openssl &>/dev/null; then echo "openssl is required." >&2; exit 1; fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fetch config from API first (cheap). If unchanged, exit without touching openclaw.
+# This keeps UX responsive (poll every 10s) while avoiding CPU load when nothing changed.
+# ──────────────────────────────────────────────────────────────────────────────
+CONFIG_URL="$OPENCLAW_API_BASE/openclaw/config"
+_config_resp="$(curl -s -S -w "\n%{http_code}" -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" "$CONFIG_URL")"
+_config_http="$(echo "$_config_resp" | tail -1)"
+RESP_BODY="$(echo "$_config_resp" | sed '$d')"
+if [ "$_config_http" != "200" ]; then
+    echo "Failed to fetch config: HTTP $_config_http" >&2
+    echo "  URL: $CONFIG_URL" >&2
+    exit 1
+fi
+if ! echo "$RESP_BODY" | jq -e . >/dev/null 2>&1; then echo "Config response is not valid JSON" >&2; exit 1; fi
+CURRENT_CONFIG_HASH="$(printf '%s' "$RESP_BODY" | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null)" || true
+[ -z "$CURRENT_CONFIG_HASH" ] && CURRENT_CONFIG_HASH="$(printf '%s' "$RESP_BODY" | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 2>/dev/null | tr -d '\n')" || true
+LAST_CONFIG_HASH=""
+[ -f "$CONFIG_HASH_FILE" ] && LAST_CONFIG_HASH="$(cat "$CONFIG_HASH_FILE" 2>/dev/null)" || true
+if [ -n "$CURRENT_CONFIG_HASH" ] && [ -n "$LAST_CONFIG_HASH" ] && [ "$CURRENT_CONFIG_HASH" = "$LAST_CONFIG_HASH" ]; then
+    exit 0
+fi
+SAVE_CONFIG_HASH_ON_EXIT=1
+RESP="$RESP_BODY"
+unset _config_resp _config_http
+echo "env: HOME=$HOME OPENCLAW_API_BASE=$OPENCLAW_API_BASE OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR PROFILES_FILE=$PROFILES_FILE" >&2
 
 # Auto-install @google/gemini-cli for Gemini OAuth credentials extraction
 if ! command -v gemini &>/dev/null && command -v npm &>/dev/null; then
@@ -288,7 +325,7 @@ full_gateway_restart() {
 
     echo "full_gateway_restart: starting gateway..." >&2
     openclaw gateway start 2>/dev/null || true
-    openclaw gateway health --timeout 20000 2>/dev/null || true
+    openclaw gateway health --timeout 10000 2>/dev/null || true
 
     # Verify auth-profiles.json still exists after start
     if [ -n "$BACKUP" ] && [ ! -f "$PROFILES_FILE" ]; then
@@ -707,15 +744,26 @@ if command -v openclaw &>/dev/null; then
         touch "$GATEWAY_INIT_FLAG"
         echo "gateway_init: plugins enabled, gateway restarted" >&2
     fi
-    openclaw gateway health --timeout 15000 2>/dev/null || true
+    openclaw gateway health --timeout 8000 2>/dev/null || true
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pre-Phase 0: Fix provider baseUrl missing https:// protocol
+# Pre-Phase 0: Fix provider baseUrl missing https:// protocol (throttled to reduce load)
 # ──────────────────────────────────────────────────────────────────────────────
+
+FIX_BASE_URLS_STAMP="${FIX_BASE_URLS_STAMP:-/tmp/openclaw-sync-fix-base-urls.stamp${_UID:+-$_UID}}"
+FIX_BASE_URLS_INTERVAL=300
 
 fix_provider_base_urls() {
     command -v openclaw &>/dev/null || return 0
+    local now mtime
+    now="$(date +%s 2>/dev/null)" || now=0
+    if [ -f "$FIX_BASE_URLS_STAMP" ]; then
+        mtime="$(stat -c %Y "$FIX_BASE_URLS_STAMP" 2>/dev/null || stat -f %m "$FIX_BASE_URLS_STAMP" 2>/dev/null)"
+        if [ -n "$mtime" ] && [ $((now - mtime)) -lt "$FIX_BASE_URLS_INTERVAL" ]; then
+            return 0
+        fi
+    fi
     local GET_RESP FIXES=""
     GET_RESP="$(gateway_call_json config.get --params '{}')" || return 0
     [ -z "$GET_RESP" ] && return 0
@@ -747,6 +795,7 @@ fix_provider_base_urls() {
             fi
         fi
     fi
+    touch "$FIX_BASE_URLS_STAMP" 2>/dev/null || true
 }
 fix_provider_base_urls
 
@@ -863,23 +912,7 @@ fi
 
 # NOTE: don't restart here — defer to a single restart after Phase 3
 # to avoid double-restart when tokens arrive in both Phase 0 and Phase 3.
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 0) Fetch config from xNode
-# ──────────────────────────────────────────────────────────────────────────────
-
-CONFIG_URL="$OPENCLAW_API_BASE/openclaw/config"
-RESP="$(curl -s -S -w "\n%{http_code}" -H "Authorization: Bearer $OPENCLAW_CONFIG_TOKEN" "$CONFIG_URL")"
-HTTP_CODE="$(echo "$RESP" | tail -1)"
-RESP_BODY="$(echo "$RESP" | sed '$d')"
-if [ "$HTTP_CODE" != "200" ]; then
-    echo "Failed to fetch config: HTTP $HTTP_CODE" >&2
-    echo "  URL: $CONFIG_URL" >&2
-    echo "  Check OPENCLAW_API_BASE in env (no trailing slash; e.g. https://api.xnode.pro). For wrong token backend returns 401, not 404." >&2
-    exit 1
-fi
-if ! echo "$RESP_BODY" | jq -e . >/dev/null 2>&1; then echo "Config response is not valid JSON" >&2; exit 1; fi
-RESP="$RESP_BODY"
+# (Config was already fetched at script start; RESP is set when config changed.)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) Write API keys to ~/.openclaw/.env + apply config via config.patch
@@ -1024,7 +1057,7 @@ needs_gateway_for_cli() {
     return 1
 }
 if [ -n "$OAUTH_URL_REQUESTS_RAW" ] && needs_gateway_for_cli; then
-    if command -v openclaw &>/dev/null && ! openclaw gateway health --timeout 10000 2>/dev/null; then
+    if command -v openclaw &>/dev/null && ! openclaw gateway health --timeout 8000 2>/dev/null; then
         GATEWAY_HEALTHY="no"
         echo "Gateway unhealthy; CLI-based auth URLs will be skipped." >&2
     fi
